@@ -217,7 +217,7 @@ def handle_telegram_update(data: dict) -> None:
                    ON CONFLICT(key) DO UPDATE SET value=excluded.value""",
                 (str(chat_id),),
             )
-            body = "Connected.\\n" + current_status()
+            body = "Connected.\n" + current_status()
             LOG.info("Telegram pairing accepted.")
         elif owner != chat_id:
             body = ("This Telegram chat is not paired. Send your private "

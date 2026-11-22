@@ -23,6 +23,9 @@ from pydantic import BaseModel, ConfigDict, Field
 
 LOG = logging.getLogger("fx_rsi_monitor")
 logging.basicConfig(level=logging.INFO)
+# The HTTP client logs the complete Telegram API URL at INFO level,
+# which would expose the bot token in hosting logs.
+logging.getLogger("httpx").setLevel(logging.WARNING)
 PAIRS = ("EURUSD", "USDJPY", "EURJPY")
 
 
@@ -192,12 +195,21 @@ def handle_telegram_update(data: dict) -> None:
                 enqueue(conn, f"reply:{update_id}", chat_id,
                         "This bot requires a private pairing code: /start YOUR_CODE")
         elif owner == chat_id:
-            if command == "/status":
-                enqueue(conn, f"reply:{update_id}", chat_id, current_status())
-            elif command in ("/start", "/help"):
+            if command in ("/start", "/help"):
                 enqueue(conn, f"reply:{update_id}", chat_id,
-                        "Send /status for EURUSD, USDJPY and EURJPY conditions. "
-                        "New RSI 30/70 events arrive automatically.")
+                        "Send /status or just type 'status' to see EURUSD, USDJPY "
+                        "and EURJPY conditions. Send /ping to check the connection.")
+            elif command == "/ping":
+                enqueue(conn, f"reply:{update_id}", chat_id,
+                        "Bot online. " + current_status())
+            elif command == "/status" or not command.startswith("/"):
+                # The owner may request status conversationally, not just by slash-command.
+                # No candle data is invented: before the first TradingView webhook,
+                # current_status() explicitly reports that it is waiting for M5 data.
+                enqueue(conn, f"reply:{update_id}", chat_id, current_status())
+            else:
+                enqueue(conn, f"reply:{update_id}", chat_id,
+                        "Unknown command. Use /status or /ping.")
         # Ignore all updates from chats other than the paired owner.
         conn.commit()
 

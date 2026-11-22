@@ -186,32 +186,48 @@ def handle_telegram_update(data: dict) -> None:
     with closing(db_connect()) as conn:
         conn.execute("BEGIN IMMEDIATE")
         owner = paired_chat(conn)
-        if owner is None:
-            if command == "/start" and hmac.compare_digest(arg, config.pairing_code):
-                conn.execute("INSERT INTO settings(key,value) VALUES('paired_chat',?)", (str(chat_id),))
+        # Log only safe diagnostic categories; never log the pairing code,
+        # user identifiers, Telegram token, or message body.
+        category = command if command in ("/start", "/ping", "/status", "/help") else "other"
+        LOG.info("Telegram command=%s paired=%s owner_match=%s",
+                 category, owner is not None, owner == chat_id)
+
+        valid_pairing = command == "/start" and hmac.compare_digest(
+            arg, config.pairing_code
+        )
+        if valid_pairing:
+            # A legitimate code holder may recover the bot from a previous
+            # accidental or outdated chat pairing; keep a single private owner.
+            conn.execute(
+                """INSERT INTO settings(key,value) VALUES('paired_chat',?)
+                   ON CONFLICT(key) DO UPDATE SET value=excluded.value""",
+                (str(chat_id),),
+            )
+            enqueue(conn, f"reply:{update_id}", chat_id,
+                    "Connected to your Telegram chat. Send /ping or /status.")
+            LOG.info("Telegram pairing accepted.")
+        elif owner != chat_id:
+            # Do not silently discard commands from the user's unpaired chat.
+            # No market conditions or owner information are disclosed.
+            if command in ("/start", "/ping", "/status", "/help") or not command.startswith("/"):
                 enqueue(conn, f"reply:{update_id}", chat_id,
-                        "Connected. Send /status to see the three M5 RSI conditions.")
-            elif command == "/start":
-                enqueue(conn, f"reply:{update_id}", chat_id,
-                        "This bot requires a private pairing code: /start YOUR_CODE")
-        elif owner == chat_id:
-            if command in ("/start", "/help"):
-                enqueue(conn, f"reply:{update_id}", chat_id,
-                        "Send /status or just type 'status' to see EURUSD, USDJPY "
-                        "and EURJPY conditions. Send /ping to check the connection.")
-            elif command == "/ping":
-                enqueue(conn, f"reply:{update_id}", chat_id,
-                        "Bot online. " + current_status())
-            elif command == "/status" or not command.startswith("/"):
-                # The owner may request status conversationally, not just by slash-command.
-                # No candle data is invented: before the first TradingView webhook,
-                # current_status() explicitly reports that it is waiting for M5 data.
-                enqueue(conn, f"reply:{update_id}", chat_id, current_status())
-            else:
-                enqueue(conn, f"reply:{update_id}", chat_id,
-                        "Unknown command. Use /status or /ping.")
-        # Ignore all updates from chats other than the paired owner.
+                        "This Telegram chat is not paired. Send the private "
+                        "pairing command: /start YOUR_PRIVATE_CODE")
+            LOG.info("Telegram command handled as unpaired.")
+        elif command in ("/start", "/help"):
+            enqueue(conn, f"reply:{update_id}", chat_id,
+                    "Send /status or type 'status' for EURUSD, USDJPY and EURJPY. "
+                    "Send /ping to test the bot.")
+        elif command == "/ping":
+            enqueue(conn, f"reply:{update_id}", chat_id,
+                    "Bot online. " + current_status())
+        elif command == "/status" or not command.startswith("/"):
+            enqueue(conn, f"reply:{update_id}", chat_id, current_status())
+        else:
+            enqueue(conn, f"reply:{update_id}", chat_id,
+                    "Unknown command. Use /status or /ping.")
         conn.commit()
+
 
 
 async def delivery_worker() -> None:

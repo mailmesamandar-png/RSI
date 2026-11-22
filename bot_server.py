@@ -27,6 +27,14 @@ logging.basicConfig(level=logging.INFO)
 # which would expose the bot token in hosting logs.
 logging.getLogger("httpx").setLevel(logging.WARNING)
 PAIRS = ("EURUSD", "USDJPY", "EURJPY")
+STATUS_BUTTON = "📊 Current Status"
+STATUS_KEYBOARD = {
+    "keyboard": [[{"text": STATUS_BUTTON}]],
+    "resize_keyboard": True,
+    "one_time_keyboard": False,
+    "is_persistent": True,
+}
+
 
 
 class Signal(BaseModel):
@@ -219,10 +227,12 @@ def handle_telegram_update(data: dict) -> None:
                     "Send /status or type 'status' for EURUSD, USDJPY and EURJPY. "
                     "Send /ping to test the bot.")
         elif command == "/ping":
-            enqueue(conn, f"reply:{update_id}", chat_id,
-                    "Bot online. " + current_status())
+            # Ping includes a status report and therefore replaces older reports.
+            enqueue(conn, f"status:{update_id}", chat_id,
+                    "Bot online.\n" + current_status())
         elif command == "/status" or not command.startswith("/"):
-            enqueue(conn, f"reply:{update_id}", chat_id, current_status())
+            # Keyboard button sends STATUS_BUTTON as a normal chat message.
+            enqueue(conn, f"status:{update_id}", chat_id, current_status())
         else:
             enqueue(conn, f"reply:{update_id}", chat_id,
                     "Unknown command. Use /status or /ping.")
@@ -231,9 +241,13 @@ def handle_telegram_update(data: dict) -> None:
 
 
 async def delivery_worker() -> None:
-    """Retry Telegram delivery; queue survives server restarts with durable storage."""
+    """Deliver messages and retain only the newest bot-generated status report.
+
+    Signal events use rsi:* IDs, never enter the deletion queue, and are
+    never deleted or edited by this feature.
+    """
     assert config is not None
-    endpoint = f"https://api.telegram.org/bot{config.telegram_token}/sendMessage"
+    endpoint = f"https://api.telegram.org/bot{config.telegram_token}"
     async with httpx.AsyncClient(timeout=8) as client:
         while True:
             try:
@@ -244,18 +258,78 @@ async def delivery_worker() -> None:
                         (time.time(),),
                     ).fetchall()
                 for row in rows:
+                    is_delete = row["id"].startswith("delete:")
+                    is_status = row["id"].startswith("status:")
                     try:
-                        result = await client.post(endpoint, json={
-                            "chat_id": row["chat_id"], "text": row["body"]
-                        })
-                        result.raise_for_status()
-                        if not result.json().get("ok"):
-                            raise RuntimeError("Telegram API returned not-ok")
-                        with closing(db_connect()) as conn:
-                            conn.execute("DELETE FROM outbox WHERE id=?", (row["id"],))
-                            conn.commit()
+                        if is_delete:
+                            # Delete only specific bot status IDs recorded after
+                            # a newer status report was successfully delivered.
+                            response = await client.post(
+                                endpoint + "/deleteMessage",
+                                json={"chat_id": row["chat_id"],
+                                      "message_id": int(row["body"])},
+                            )
+                            if response.status_code == 400:
+                                # Telegram cannot delete some old messages
+                                # (e.g. older than 48 hours); avoid endless retries.
+                                LOG.warning("Previous status cannot be deleted (Telegram 400).")
+                            else:
+                                response.raise_for_status()
+                                if not response.json().get("ok"):
+                                    raise RuntimeError("Telegram deletion returned not-ok")
+                            with closing(db_connect()) as conn:
+                                conn.execute("DELETE FROM outbox WHERE id=?", (row["id"],))
+                                conn.commit()
+                            continue
+
+                        payload = {"chat_id": row["chat_id"], "text": row["body"]}
+                        if is_status or row["id"].startswith("reply:"):
+                            # The button persists in the owner's chat even when
+                            # the current status message is replaced later.
+                            with closing(db_connect()) as conn:
+                                if paired_chat(conn) == row["chat_id"]:
+                                    payload["reply_markup"] = STATUS_KEYBOARD
+
+                        response = await client.post(endpoint + "/sendMessage",
+                                                     json=payload)
+                        response.raise_for_status()
+                        result = response.json()
+                        if not result.get("ok"):
+                            raise RuntimeError("Telegram send returned not-ok")
+
+                        if is_status:
+                            message_id = result.get("result", {}).get("message_id")
+                            if not isinstance(message_id, int):
+                                raise RuntimeError("Telegram response missing message_id")
+                            key = "last_status_message:" + str(row["chat_id"])
+                            with closing(db_connect()) as conn:
+                                conn.execute("BEGIN IMMEDIATE")
+                                old = conn.execute(
+                                    "SELECT value FROM settings WHERE key=?", (key,)
+                                ).fetchone()
+                                conn.execute(
+                                    """INSERT INTO settings(key,value) VALUES(?,?)
+                                       ON CONFLICT(key) DO UPDATE SET value=excluded.value""",
+                                    (key, str(message_id)),
+                                )
+                                if old and old["value"] != str(message_id):
+                                    # Only a known status report ID is enqueued.
+                                    # Never inspect, edit or delete RSI signal IDs.
+                                    old_id = int(old["value"])
+                                    enqueue(conn, f"delete:{row['chat_id']}:{old_id}",
+                                            row["chat_id"], str(old_id))
+                                conn.execute("DELETE FROM outbox WHERE id=?", (row["id"],))
+                                conn.commit()
+                        else:
+                            with closing(db_connect()) as conn:
+                                conn.execute("DELETE FROM outbox WHERE id=?", (row["id"],))
+                                conn.commit()
                     except Exception as ex:
-                        LOG.warning("Telegram delivery deferred for %s: %s", row["id"], ex)
+                        # Do not log HTTP URLs: Telegram URLs contain the bot token.
+                        LOG.warning("Telegram %s deferred (%s)",
+                                    "status cleanup" if is_delete else
+                                    "status reply" if is_status else "message",
+                                    type(ex).__name__)
                         backoff = min(300, 2 ** min(int(row["attempts"]) + 1, 8))
                         with closing(db_connect()) as conn:
                             conn.execute(

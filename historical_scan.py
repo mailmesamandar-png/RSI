@@ -9,6 +9,9 @@ from __future__ import annotations
 import asyncio
 import lzma
 import logging
+import os
+from pathlib import Path
+from email.utils import parsedate_to_datetime
 import math
 import struct
 import time
@@ -27,6 +30,9 @@ HOUR_MS = 3_600_000
 DAY_MS = 86_400_000
 SCAN_HOURS = 24
 WARMUP_ACTIVE_HOURS = 8
+CACHE_DIR = Path(os.getenv("HISTORICAL_CACHE_DIR", "/data/dukascopy-cache"))
+MIN_REQUEST_INTERVAL_SECONDS = 2.0
+RATE_LIMIT_COOLDOWN_SECONDS = 300
 URLS = (
     "https://datafeed.dukascopy.com/datafeed",
     "https://www.dukascopy.com/datafeed",
@@ -35,6 +41,10 @@ URLS = (
 
 class ScanUnavailable(Exception):
     """Cannot complete a historical replay without usable market data."""
+
+
+class ScanRateLimited(ScanUnavailable):
+    """Dukascopy has asked us to stop requesting data temporarily."""
 
 
 @dataclass(frozen=True)
@@ -145,12 +155,14 @@ def replay_one(ticker: str, ticks: list[tuple[int, float]],
 
 
 def _possibly_open(dt: datetime) -> bool:
-    # Conservative weekend screening. Empty hours are still allowed if
-    # provider reports none, and daylight-saving shift may vary by week.
-    day = dt.weekday()
+    """Filter market-closed hours using New York time, including EST/EDT."""
+    ny = dt.astimezone(NY)
+    day = ny.weekday()
     if day == 5:
         return False
-    if day == 6 and dt.hour < 20:
+    if day == 4 and ny.hour >= 17:
+        return False
+    if day == 6 and ny.hour < 17:
         return False
     return True
 
@@ -207,93 +219,159 @@ def _decode_tick_hour(data: bytes, hour_ms: int, scale: float
     return samples
 
 
-async def _read_hour(client: httpx.AsyncClient, semaphore: asyncio.Semaphore,
-                     ticker: str, hour_ms: int) -> list[tuple[int, float]]:
+def _cached_hour_path(ticker: str, hour_ms: int) -> Path:
+    return CACHE_DIR / ticker / f"{hour_ms}.bi5"
+
+
+def _cached_rate_limit_end() -> float:
+    path = CACHE_DIR / "cooldown_until.txt"
+    try:
+        return float(path.read_text().strip())
+    except (OSError, ValueError):
+        return 0.0
+
+
+def _set_rate_limit_end(duration_seconds: float) -> None:
+    try:
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        until = max(time.time() + duration_seconds, _cached_rate_limit_end())
+        (CACHE_DIR / "cooldown_until.txt").write_text(str(until))
+    except OSError:
+        LOG.warning("Unable to persist Dukascopy cooldown")
+
+
+def _retry_after_seconds(value: str | None) -> float:
+    if not value:
+        return 30.0
+    try:
+        return max(1.0, float(value))
+    except ValueError:
+        try:
+            return max(1.0, parsedate_to_datetime(value).timestamp() - time.time())
+        except (TypeError, ValueError, OverflowError):
+            return 30.0
+
+
+async def _read_hour(client: httpx.AsyncClient,
+                     ticker: str, hour_ms: int
+                     ) -> list[tuple[int, float]]:
+    """Fetch conservatively; never switch hosts in order to evade HTTP 429."""
     dt = datetime.fromtimestamp(hour_ms / 1000, timezone.utc)
     path = (f"{ticker}/{dt.year}/{dt.month - 1:02d}/"
             f"{dt.day:02d}/{dt.hour:02d}h_ticks.bi5")
-    bad_hosts = 0
-    last_status: int | None = None
+    cached = _cached_hour_path(ticker, hour_ms)
+    # Closed historical hours are immutable and may be reused across scans.
+    is_final_hour = hour_ms + HOUR_MS < int(time.time() * 1000) - 10 * 60 * 1000
+    if is_final_hour:
+        try:
+            if cached.exists():
+                return _decode_tick_hour(cached.read_bytes(), hour_ms,
+                                         PAIR_SCALES[ticker])
+        except (OSError, ScanUnavailable):
+            LOG.warning("Discarding invalid cached data ticker=%s hour=%s",
+                        ticker, dt.strftime("%Y-%m-%d %H UTC"))
+            try:
+                cached.unlink(missing_ok=True)
+            except OSError:
+                pass
 
-    async with semaphore:
-        for base in URLS:
+    cooldown = _cached_rate_limit_end() - time.time()
+    if cooldown > 0:
+        raise ScanRateLimited(
+            f"Dukascopy is rate-limiting historical requests. "
+            f"Please wait about {math.ceil(cooldown / 60)} minute(s) before retrying."
+        )
+
+    last_status: int | None = None
+    for base in URLS:
+        # A secondary hostname is only used after a non-429 transport error
+        # or invalid archive, never to circumvent a provider rate limit.
+        for attempt in range(2):
             try:
                 response = await client.get(
                     f"{base}/{path}", follow_redirects=True,
                     headers={"Accept": "application/octet-stream"},
                 )
             except (httpx.RequestError, httpx.TimeoutException):
-                LOG.warning("Historical feed transport error ticker=%s hour=%s",
+                LOG.warning("Historical transport error ticker=%s hour=%s",
                             ticker, dt.strftime("%Y-%m-%d %H UTC"))
-                continue
-
+                break
             last_status = response.status_code
+            if response.status_code == 429:
+                wait = _retry_after_seconds(response.headers.get("retry-after"))
+                LOG.warning("Dukascopy HTTP 429 ticker=%s hour=%s retry_s=%.0f",
+                            ticker, dt.strftime("%Y-%m-%d %H UTC"), wait)
+                # Respect large Retry-After values rather than spin-wait or
+                # try a second host. Persist delay across bot restarts.
+                if wait > 90 or attempt == 1:
+                    _set_rate_limit_end(max(RATE_LIMIT_COOLDOWN_SECONDS, wait))
+                    raise ScanRateLimited(
+                        "Dukascopy has temporarily blocked historical downloads "
+                        "with HTTP 429. The scanner is pausing requests to respect "
+                        "the provider's limit. Please retry later."
+                    )
+                await asyncio.sleep(wait)
+                continue
             if response.status_code == 404:
-                # A 404 normally identifies a truly missing archive.
-                # Unlike a malformed 200, this is not a parser failure.
                 return []
             if response.status_code != 200:
-                LOG.warning("Historical feed non-200 ticker=%s hour=%s status=%d",
-                            ticker, dt.strftime("%Y-%m-%d %H UTC"), response.status_code)
-                continue
-
-            if not response.content:
-                # This IS normal, and is the key fix for Monday/weekend scans:
-                # HTTP 200 + empty body is no ticks, NOT an LZMA archive.
-                return []
-
+                LOG.warning("Historical HTTP %s ticker=%s hour=%s",
+                            response.status_code, ticker,
+                            dt.strftime("%Y-%m-%d %H UTC"))
+                break
             try:
-                return _decode_tick_hour(response.content, hour_ms,
-                                         PAIR_SCALES[ticker])
+                ticks = _decode_tick_hour(response.content, hour_ms,
+                                          PAIR_SCALES[ticker])
             except ScanUnavailable:
-                bad_hosts += 1
-                LOG.warning(
-                    "Historical feed invalid tick format ticker=%s hour=%s "
-                    "bytes=%d content_type=%s",
-                    ticker, dt.strftime("%Y-%m-%d %H UTC"),
-                    len(response.content),
-                    response.headers.get("content-type", "unknown")[:60],
-                )
-                # A CDN can return HTML with HTTP 200 instead of .bi5.
-                # Try the alternate feed host before failing.
-                continue
+                LOG.warning("Malformed .bi5 archive ticker=%s hour=%s bytes=%s",
+                            ticker, dt.strftime("%Y-%m-%d %H UTC"),
+                            len(response.content))
+                break
+            if is_final_hour:
+                try:
+                    cached.parent.mkdir(parents=True, exist_ok=True)
+                    temp = cached.with_suffix(".tmp")
+                    temp.write_bytes(response.content)
+                    temp.replace(cached)
+                except OSError:
+                    LOG.warning("Could not cache historical tick hour")
+            return ticks
 
-    if bad_hosts:
-        raise ScanUnavailable(
-            "Dukascopy returned non-bi5 data for at least one hour, including "
-            "the backup server. Please retry later."
-        )
     raise ScanUnavailable(
-        "Dukascopy historical feed is unreachable or rate-limited"
+        "Dukascopy did not provide a valid hourly tick file"
         + (f" (last HTTP {last_status})." if last_status else ".")
     )
 
+
 async def scan_last_24h() -> tuple[list[ScanSignal], float, float]:
-    """Fetch public Dukascopy ticks for the last available 24h and replay M5 RSI."""
+    """Paced, cached, honest historical replay of available last-24h ticks."""
     end_ms = int(time.time() * 1000)
     start_ms = end_ms - SCAN_HOURS * 60 * 60 * 1000
     hours = _hours_to_read(start_ms, end_ms)
     if not hours:
-        raise ScanUnavailable("No accessible trading hours in the requested period.")
-    semaphore = asyncio.Semaphore(6)
-    timeout = httpx.Timeout(25.0, connect=10.0)
+        raise ScanUnavailable("There are no trading hours within the scan window.")
+
+    # One request at a time; no concurrent burst at the public provider.
+    # Keep each successfully downloaded historic hour on the Railway volume
+    # so repeated scans fetch only newly available data.
+    timeout = httpx.Timeout(30.0, connect=10.0)
+    results: list[ScanSignal] = []
+    total_ticks = 0
     async with httpx.AsyncClient(timeout=timeout) as client:
-        # Limit memory: download/replay one instrument at a time.
-        results: list[ScanSignal] = []
-        total_ticks = 0
         for ticker in PAIR_SCALES:
-            hour_data = await asyncio.gather(
-                *(_read_hour(client, semaphore, ticker, hour) for hour in hours)
-            )
-            ticks = [sample for chunk in hour_data for sample in chunk]
+            ticks: list[tuple[int, float]] = []
+            for hour in hours:
+                cached = _cached_hour_path(ticker, hour)
+                was_cached = cached.exists()
+                chunk = await _read_hour(client, ticker, hour)
+                ticks.extend(chunk)
+                if not was_cached:
+                    await asyncio.sleep(MIN_REQUEST_INTERVAL_SECONDS)
             total_ticks += len(ticks)
             results.extend(replay_one(ticker, ticks, start_ms, end_ms))
-            del hour_data, ticks
-
     if total_ticks == 0:
         raise ScanUnavailable(
-            "No ticks were returned. The market may be closed or historical data "
-            "may not yet have been published."
+            "No historical ticks were available. Provider may be delayed or market closed."
         )
     return sorted(results, key=lambda s: (s.time_ms, s.ticker)), (
         start_ms / 1000), (end_ms / 1000)

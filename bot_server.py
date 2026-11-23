@@ -20,7 +20,7 @@ from zoneinfo import ZoneInfo
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 LOG = logging.getLogger("fx_rsi_monitor")
 logging.basicConfig(level=logging.INFO)
@@ -652,6 +652,7 @@ async def tradingview_webhook(secret: str, request: Request):
         raise HTTPException(status_code=403, detail="Forbidden")
     if int(request.headers.get("content-length", "0")) > 8000:
         raise HTTPException(status_code=413, detail="Payload too large")
+    payload = None
     try:
         payload = await request.json()
         if not isinstance(payload, dict):
@@ -664,6 +665,25 @@ async def tradingview_webhook(secret: str, request: Request):
         updated = accept_snapshot(snapshot)
         return {"ok": True, "new_candle": updated}
     except Exception as ex:
+        # Safe diagnostics: NEVER log payload/body, URL (contains webhook
+        # secret), token, user data, or values of fields. Report error classes
+        # and pydantic field NAMES only.
+        if isinstance(ex, ValidationError):
+            fields = ",".join(
+                ".".join(str(p) for p in error["loc"]) + ":" + error["type"]
+                for error in ex.errors()
+            )
+        else:
+            fields = "-"
+        version = payload.get("version") if isinstance(payload, dict) else None
+        LOG.warning(
+            "TradingView webhook rejected status=422 version=%s content_type=%s "
+            "error=%s fields=%s",
+            version if isinstance(version, int) else "unknown",
+            request.headers.get("content-type", "missing").split(";")[0][:40],
+            type(ex).__name__,
+            fields,
+        )
         raise HTTPException(status_code=422, detail=type(ex).__name__) from ex
 
 

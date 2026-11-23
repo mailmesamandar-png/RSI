@@ -1,31 +1,35 @@
 //@version=6
-// FX RSI Dedicated Pair V2.2 - tablet-safe flat code.
-// One chart + one alert per OANDA pair on M5.
-// Immediate RSI 70/30 touch, then locked until RSI touches 50.
-indicator("FX RSI Dedicated Pair V2.2", overlay=false)
+// FX RSI Dedicated Pair V2.3 - independent RSI 50 lock.
+// RSI 30/70 event -> arm one RSI 50 reset.
+// RSI 50 reset -> arm one RSI 30/70 event.
+// Send a quiet status heartbeat once at every M5 close.
+indicator("FX RSI Dedicated Pair V2.3", overlay=false)
 r = ta.rsi(close, 14)
 plot(r, "RSI 14", color=color.purple, linewidth=2)
 hline(70, "70", color=color.red)
 hline(50, "50 RESET", color=color.gray)
 hline(30, "30", color=color.green)
 varip float prev = na
-varip bool armed = true
+varip bool signalArmed = true
+varip bool resetArmed = false
 varip int state = 0
 varip int lastMs = 0
 h70 = ta.crossover(r, 70)
 h30 = ta.crossunder(r, 30)
 h50 = ta.cross(r, 50)
 live = barstate.isrealtime and not na(prev) and not na(r)
-reset50 = (live and ((prev < 50 and r >= 50) or (prev > 50 and r <= 50))) or (barstate.ishistory and h50)
-hit70 = (live and prev < 70 and r >= 70) or (barstate.ishistory and h70)
-hit30 = (live and prev > 30 and r <= 30) or (barstate.ishistory and h30)
-sig70 = (armed or reset50) and hit70
-sig30 = (armed or reset50) and not sig70 and hit30
+cross70 = (live and prev < 70 and r >= 70) or (barstate.ishistory and h70)
+cross30 = (live and prev > 30 and r <= 30) or (barstate.ishistory and h30)
+cross50 = (live and ((prev < 50 and r >= 50) or (prev > 50 and r <= 50))) or (barstate.ishistory and h50)
+sig70 = signalArmed and cross70
+sig30 = signalArmed and not sig70 and cross30
 level = sig70 ? 70 : sig30 ? 30 : 0
+reset50 = resetArmed and cross50 and level == 0
+signalArmed := level != 0 ? false : reset50 ? true : signalArmed
+resetArmed := level != 0 ? true : reset50 ? false : resetArmed
 state := level == 70 ? 1 : level == 30 ? 2 : reset50 ? 0 : state
-armed := level != 0 ? false : reset50 ? true : armed
 prev := r
-plotshape(live and reset50 ? 50.0 : na, title="Live 50 reset", style=shape.circle, location=location.absolute, color=color.gray, size=size.tiny)
+plotshape(live and reset50 ? 50.0 : na, title="One RSI 50 reset", style=shape.circle, location=location.absolute, color=color.gray, size=size.tiny)
 plotshape(live and sig70 ? 70.0 : na, title="Live RSI 70", style=shape.triangledown, location=location.absolute, color=color.red, size=size.small)
 plotshape(live and sig30 ? 30.0 : na, title="Live RSI 30", style=shape.triangleup, location=location.absolute, color=color.green, size=size.small)
 var table t = table.new(position.top_right, 2, 3)
@@ -34,7 +38,7 @@ table.cell(t, 1, 0, "RSI " + str.tostring(r, "#.##"))
 table.cell(t, 0, 1, "STATUS")
 table.cell(t, 1, 1, state == 1 ? "BUY" : state == 2 ? "SELL" : "RANGE")
 table.cell(t, 0, 2, "LOCK")
-table.cell(t, 1, 2, armed ? "ARMED" : "WAIT RSI 50")
+table.cell(t, 1, 2, signalArmed ? "30/70 ARMED" : "WAIT RSI 50")
 sendNow = barstate.isrealtime and (reset50 or level != 0 or barstate.isconfirmed)
 eventMs = math.max(timenow, lastMs + 1)
 lastMs := sendNow ? eventMs : lastMs

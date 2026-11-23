@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import lzma
+import logging
 import math
 import struct
 import time
@@ -17,6 +18,7 @@ from zoneinfo import ZoneInfo
 
 import httpx
 
+LOG = logging.getLogger("fx_rsi_historical_scan")
 
 PAIR_SCALES = {"EURUSD": 100_000.0, "USDJPY": 1_000.0, "EURJPY": 1_000.0}
 NY = ZoneInfo("America/New_York")
@@ -183,11 +185,17 @@ def _hours_to_read(start_ms: int, end_ms: int) -> list[int]:
 
 def _decode_tick_hour(data: bytes, hour_ms: int, scale: float
                       ) -> list[tuple[int, float]]:
+    if not data:
+        # Dukascopy frequently returns 200 with ZERO bytes for a closed
+        # market hour or an hour whose tick archive is not published yet.
+        return []
+    if len(data) > 15_000_000:
+        raise ScanUnavailable("Historical tick download exceeded safe size.")
     try:
         raw = lzma.decompress(data)
-    except lzma.LZMAError as ex:
-        raise ScanUnavailable("The historical tick feed returned unreadable data.") from ex
-    if len(raw) % 20:
+    except (lzma.LZMAError, EOFError) as ex:
+        raise ScanUnavailable("Historical data source returned a non-bi5/corrupt tick file.") from ex
+    if len(raw) > 150_000_000 or len(raw) % 20:
         raise ScanUnavailable("Historical tick feed has an invalid record size.")
     samples = []
     for ms_into_hour, ask, bid, _, _ in struct.iter_unpack(">IIIff", raw):
@@ -204,22 +212,61 @@ async def _read_hour(client: httpx.AsyncClient, semaphore: asyncio.Semaphore,
     dt = datetime.fromtimestamp(hour_ms / 1000, timezone.utc)
     path = (f"{ticker}/{dt.year}/{dt.month - 1:02d}/"
             f"{dt.day:02d}/{dt.hour:02d}h_ticks.bi5")
+    bad_hosts = 0
+    last_status: int | None = None
+
     async with semaphore:
         for base in URLS:
             try:
-                resp = await client.get(f"{base}/{path}", follow_redirects=True)
-                if resp.status_code == 404:
-                    # Closed market / missing file, not a signal.
-                    return []
-                if resp.status_code == 200:
-                    return _decode_tick_hour(resp.content, hour_ms, PAIR_SCALES[ticker])
-                # Try the fallback host on regional or rate-limiting responses.
+                response = await client.get(
+                    f"{base}/{path}", follow_redirects=True,
+                    headers={"Accept": "application/octet-stream"},
+                )
             except (httpx.RequestError, httpx.TimeoutException):
+                LOG.warning("Historical feed transport error ticker=%s hour=%s",
+                            ticker, dt.strftime("%Y-%m-%d %H UTC"))
                 continue
-    # Failed downloads are not treated as no-signal hours: that would give
-    # misleading backtests with artificial gaps.
-    raise ScanUnavailable("The public historical forex feed is temporarily unreachable.")
 
+            last_status = response.status_code
+            if response.status_code == 404:
+                # A 404 normally identifies a truly missing archive.
+                # Unlike a malformed 200, this is not a parser failure.
+                return []
+            if response.status_code != 200:
+                LOG.warning("Historical feed non-200 ticker=%s hour=%s status=%d",
+                            ticker, dt.strftime("%Y-%m-%d %H UTC"), response.status_code)
+                continue
+
+            if not response.content:
+                # This IS normal, and is the key fix for Monday/weekend scans:
+                # HTTP 200 + empty body is no ticks, NOT an LZMA archive.
+                return []
+
+            try:
+                return _decode_tick_hour(response.content, hour_ms,
+                                         PAIR_SCALES[ticker])
+            except ScanUnavailable:
+                bad_hosts += 1
+                LOG.warning(
+                    "Historical feed invalid tick format ticker=%s hour=%s "
+                    "bytes=%d content_type=%s",
+                    ticker, dt.strftime("%Y-%m-%d %H UTC"),
+                    len(response.content),
+                    response.headers.get("content-type", "unknown")[:60],
+                )
+                # A CDN can return HTML with HTTP 200 instead of .bi5.
+                # Try the alternate feed host before failing.
+                continue
+
+    if bad_hosts:
+        raise ScanUnavailable(
+            "Dukascopy returned non-bi5 data for at least one hour, including "
+            "the backup server. Please retry later."
+        )
+    raise ScanUnavailable(
+        "Dukascopy historical feed is unreachable or rate-limited"
+        + (f" (last HTTP {last_status})." if last_status else ".")
+    )
 
 async def scan_last_24h() -> tuple[list[ScanSignal], float, float]:
     """Fetch public Dukascopy ticks for the last available 24h and replay M5 RSI."""

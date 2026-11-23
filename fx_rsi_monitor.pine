@@ -1,86 +1,94 @@
 //@version=6
-// FINAL SIGNAL TIMING: Only a COMPLETED 5-minute bar can trigger RSI 30/70
-// alerts or silently reset at RSI 50. Intrabar RSI touches are ignored.
-// The alert lockout is independent for each of the three currency pairs.
-indicator("FX RSI 3-Pair Monitor | M5 -> Telegram", overlay = true)
+// M5 RSI 14: alert on EVERY fresh intrabar touch of 70 or 30.
+// No 5-minute close required for 30/70. Repeated re-entries are distinct touches.
+// An M5 candle CLOSE is still required for RSI 50 RANGE/reset.
+// Uses realtime tick observations; historical bars cannot reconstruct intrabar touches.
+indicator("FX RSI 3-Pair Monitor | M5 Intrabar Touches -> Telegram", overlay = true)
 
-// Exactly three cross-pairs, all from the SAME broker/feed where possible.
-// Put the indicator on any 5-minute TradingView chart with regular FX data.
 string eurusdSymbol = input.symbol("OANDA:EURUSD", "EURUSD feed", group = "FX pairs")
 string usdjpySymbol = input.symbol("OANDA:USDJPY", "USDJPY feed", group = "FX pairs")
 string eurjpySymbol = input.symbol("OANDA:EURJPY", "EURJPY feed", group = "FX pairs")
 int rsiLength = input.int(14, "RSI length", minval = 2, group = "RSI")
 
-// Using an M5 chart is intentional: remote M5 bars must align with chart bars.
 if timeframe.in_seconds() != 300
     runtime.error("Use this indicator on a 5-minute chart. All three RSI series are M5.")
 
 f_data() =>
     float r = ta.rsi(close, rsiLength)
-    bool crossed70 = ta.crossover(r, 70)
-    bool crossed30 = ta.crossunder(r, 30)
-    bool crossed50 = ta.cross(r, 50)
-    [r, crossed70, crossed30, crossed50]
+    [r, ta.crossover(r, 70), ta.crossunder(r, 30), ta.cross(r, 50)]
 
-[eurusdRsi, eurusd70, eurusd30, eurusd50] = request.security(eurusdSymbol, "5", f_data(), gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_off)
-[usdjpyRsi, usdjpy70, usdjpy30, usdjpy50] = request.security(usdjpySymbol, "5", f_data(), gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_off)
-[eurjpyRsi, eurjpy70, eurjpy30, eurjpy50] = request.security(eurjpySymbol, "5", f_data(), gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_off)
+[eurusdRsi, eurusd70Close, eurusd30Close, eurusd50Close] = request.security(eurusdSymbol, "5", f_data(), gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_off)
+[usdjpyRsi, usdjpy70Close, usdjpy30Close, usdjpy50Close] = request.security(usdjpySymbol, "5", f_data(), gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_off)
+[eurjpyRsi, eurjpy70Close, eurjpy30Close, eurjpy50Close] = request.security(eurjpySymbol, "5", f_data(), gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_off)
 
-// State codes: 0=RANGE (last crossed 50), 1=BUY (last crossed 70),
-//              2=SELL (last crossed 30).
-// Alert lockout is PER PAIR, not shared: a different pair can alert simultaneously.
-var int eurusdState = 0
-var int usdjpyState = 0
-var int eurjpyState = 0
-var bool eurusdArmed = true
-var bool usdjpyArmed = true
-var bool eurjpyArmed = true
+// Intrabar persistence is essential: ordinary "var" rolls back on each tick.
+// These previous values update with EVERY chart tick, not with candle closes.
+varip float prevEurusdRsi = na
+varip float prevUsdjpyRsi = na
+varip float prevEurjpyRsi = na
 
-int eurusdSignal = 0
-int usdjpySignal = 0
-int eurjpySignal = 0
+// 0=RANGE; 1=BUY (last 70 touch); 2=SELL (last 30 touch).
+// Only a confirmed M5 crossing of 50 returns a pair to RANGE.
+// There is NO 50-level lockout on new 70/30 touches.
+varip int eurusdState = 0
+varip int usdjpyState = 0
+varip int eurjpyState = 0
+varip int lastEventMs = 0
 
-// Commit RSI crossings and lockout resets ONLY at the 5-minute candle close.
-// No intrabar event may change a persistent state or send a notification.
+// On a realtime update, detect the exact new touch from the preceding tick:
+//   below 70 -> >=70; above 30 -> <=30.
+// A second upward touch after dropping back below 70 is a NEW signal,
+// even if the RSI never crossed 50 between the two touches.
+bool eurusdTouch70 = barstate.isrealtime and not na(prevEurusdRsi) and not na(eurusdRsi) and prevEurusdRsi < 70 and eurusdRsi >= 70
+bool eurusdTouch30 = barstate.isrealtime and not na(prevEurusdRsi) and not na(eurusdRsi) and prevEurusdRsi > 30 and eurusdRsi <= 30
+bool usdjpyTouch70 = barstate.isrealtime and not na(prevUsdjpyRsi) and not na(usdjpyRsi) and prevUsdjpyRsi < 70 and usdjpyRsi >= 70
+bool usdjpyTouch30 = barstate.isrealtime and not na(prevUsdjpyRsi) and not na(usdjpyRsi) and prevUsdjpyRsi > 30 and usdjpyRsi <= 30
+bool eurjpyTouch70 = barstate.isrealtime and not na(prevEurjpyRsi) and not na(eurjpyRsi) and prevEurjpyRsi < 70 and eurjpyRsi >= 70
+bool eurjpyTouch30 = barstate.isrealtime and not na(prevEurjpyRsi) and not na(eurjpyRsi) and prevEurjpyRsi > 30 and eurjpyRsi <= 30
+
+// The 50-level RANGE transition remains candle-close-only.
 if barstate.isconfirmed
-    if not na(eurusdRsi)
-        if eurusd50
-            eurusdState := 0
-            eurusdArmed := true
-        if eurusdArmed and eurusd70
+    if eurusd50Close
+        eurusdState := 0
+    if usdjpy50Close
+        usdjpyState := 0
+    if eurjpy50Close
+        eurjpyState := 0
+
+    // Reconstruct a reasonable historical display using M5 closes only.
+    // Historical tick-by-tick 70/30 touches are NOT available to Pine.
+    if not barstate.isrealtime
+        if eurusd70Close
             eurusdState := 1
-            eurusdArmed := false
-            eurusdSignal := 70
-        else if eurusdArmed and eurusd30
+        if eurusd30Close
             eurusdState := 2
-            eurusdArmed := false
-            eurusdSignal := 30
-
-    if not na(usdjpyRsi)
-        if usdjpy50
-            usdjpyState := 0
-            usdjpyArmed := true
-        if usdjpyArmed and usdjpy70
+        if usdjpy70Close
             usdjpyState := 1
-            usdjpyArmed := false
-            usdjpySignal := 70
-        else if usdjpyArmed and usdjpy30
+        if usdjpy30Close
             usdjpyState := 2
-            usdjpyArmed := false
-            usdjpySignal := 30
-
-    if not na(eurjpyRsi)
-        if eurjpy50
-            eurjpyState := 0
-            eurjpyArmed := true
-        if eurjpyArmed and eurjpy70
+        if eurjpy70Close
             eurjpyState := 1
-            eurjpyArmed := false
-            eurjpySignal := 70
-        else if eurjpyArmed and eurjpy30
+        if eurjpy30Close
             eurjpyState := 2
-            eurjpyArmed := false
-            eurjpySignal := 30
+
+// Realtime touches take effect NOW, whether or not the candle is closed.
+if eurusdTouch70
+    eurusdState := 1
+if eurusdTouch30
+    eurusdState := 2
+if usdjpyTouch70
+    usdjpyState := 1
+if usdjpyTouch30
+    usdjpyState := 2
+if eurjpyTouch70
+    eurjpyState := 1
+if eurjpyTouch30
+    eurjpyState := 2
+
+// Save last observed tick RSI AFTER evaluating fresh touches.
+prevEurusdRsi := eurusdRsi
+prevUsdjpyRsi := usdjpyRsi
+prevEurjpyRsi := eurjpyRsi
 
 f_state(int state) =>
     state == 1 ? "BUY" : state == 2 ? "SELL" : "RANGE"
@@ -88,7 +96,6 @@ f_state(int state) =>
 f_color(int state) =>
     state == 1 ? color.new(color.green, 5) : state == 2 ? color.new(color.red, 5) : color.new(color.gray, 30)
 
-// Optional chart table. It never makes trade decisions.
 var table statusTable = table.new(position.top_right, 2, 4, border_width = 1)
 if barstate.islast
     table.cell(statusTable, 0, 0, "M5 PAIR", text_color = color.white, bgcolor = color.black)
@@ -100,20 +107,27 @@ if barstate.islast
     table.cell(statusTable, 0, 3, "EURJPY")
     table.cell(statusTable, 1, 3, f_state(eurjpyState), text_color = color.white, bgcolor = f_color(eurjpyState))
 
-// Exactly ONE webhook payload per confirmed, live M5 candle.
-// alert.freq_once_per_bar_close is a second guard against intrabar alerts.
-// It includes all three states, and ZERO TO THREE events. The Telegram backend
-// only posts events, while every payload updates the on-demand /status report.
-// A reset at 50 produces NO Telegram message.
-if barstate.isconfirmed and barstate.isrealtime and not na(eurusdRsi) and not na(usdjpyRsi) and not na(eurjpyRsi)
+// Send an intrabar webhook as soon as ANY new 70/30 touch is observed.
+// ALSO send a silent snapshot on each M5 close so /status stays current.
+// Each snapshot carries all three statuses and zero-to-three touch signals.
+// The "bar_time" field is now the actual realtime event time, not the
+// candle close, so the backend can accept multiple events within one M5 bar.
+// alert.freq_all is REQUIRED; once_per_bar_close would drop extra touches.
+bool hasTouch = eurusdTouch70 or eurusdTouch30 or usdjpyTouch70 or usdjpyTouch30 or eurjpyTouch70 or eurjpyTouch30
+bool emitSnapshot = barstate.isrealtime and (hasTouch or barstate.isconfirmed)
+if emitSnapshot and not na(eurusdRsi) and not na(usdjpyRsi) and not na(eurjpyRsi)
     string events = ""
-    if eurusdSignal != 0
-        events := "{\"ticker\":\"EURUSD\",\"level\":" + str.tostring(eurusdSignal) + "}"
-    if usdjpySignal != 0
-        events := events + (str.length(events) > 0 ? "," : "") + "{\"ticker\":\"USDJPY\",\"level\":" + str.tostring(usdjpySignal) + "}"
-    if eurjpySignal != 0
-        events := events + (str.length(events) > 0 ? "," : "") + "{\"ticker\":\"EURJPY\",\"level\":" + str.tostring(eurjpySignal) + "}"
+    if eurusdTouch70 or eurusdTouch30
+        events := "{\"ticker\":\"EURUSD\",\"level\":" + str.tostring(eurusdTouch70 ? 70 : 30) + "}"
+    if usdjpyTouch70 or usdjpyTouch30
+        events := events + (str.length(events) > 0 ? "," : "") + "{\"ticker\":\"USDJPY\",\"level\":" + str.tostring(usdjpyTouch70 ? 70 : 30) + "}"
+    if eurjpyTouch70 or eurjpyTouch30
+        events := events + (str.length(events) > 0 ? "," : "") + "{\"ticker\":\"EURJPY\",\"level\":" + str.tostring(eurjpyTouch70 ? 70 : 30) + "}"
 
-    string states = "\"EURUSD\":\"" + f_state(eurusdState) + "\"," + "\"USDJPY\":\"" + f_state(usdjpyState) + "\"," + "\"EURJPY\":\"" + f_state(eurjpyState) + "\""
-    string payload = "{\"version\":1,\"bar_time\":" + str.tostring(time_close) + ",\"states\":{" + states + "},\"signals\":[" + events + "]}"
-    alert(payload, alert.freq_once_per_bar_close)
+    // A monotonic event timestamp prevents deduplication of separate touches
+    // that TradingView happens to observe in the same millisecond.
+    int eventMs = math.max(timenow, lastEventMs + 1)
+    lastEventMs := eventMs
+    string states = "\"EURUSD\":\"" + f_state(eurusdState) + "\",\"USDJPY\":\"" + f_state(usdjpyState) + "\",\"EURJPY\":\"" + f_state(eurjpyState) + "\""
+    string payload = "{\"version\":1,\"bar_time\":" + str.tostring(eventMs) + ",\"states\":{" + states + "},\"signals\":[" + events + "]}"
+    alert(payload, alert.freq_all)

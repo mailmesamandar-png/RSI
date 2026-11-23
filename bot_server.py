@@ -270,7 +270,7 @@ def handle_telegram_update(data: dict) -> None:
                     (update_id, chat_id, int(time.time())),
                 )
                 body = ("🔎 Scanning available market history from the last 24 hours. "
-                        "Using OANDA 5-second candles to approximate RSI 14 intrabar touches. "
+                        "Using public Dukascopy tick history to approximate RSI 14 intrabar touches. "
                         "Results are not live signals.")
         else:
             # The Current Status button and /status preserve existing behavior.
@@ -358,7 +358,7 @@ async def historical_scan_worker() -> None:
                             conn,
                             f"replay:{job_id}:{signal.time_ms}:{signal.ticker}:{signal.level}",
                             chat_id,
-                            f"🧪 HISTORICAL ESTIMATE (OANDA S5)\n"
+                            f"🧪 HISTORICAL ESTIMATE (DUKASCOPY TICKS)\n"
                             f"{signal.ticker} — RSI {signal.level}\n"
                             f"NY: {signal.ny_time}",
                         )
@@ -368,10 +368,10 @@ async def historical_scan_worker() -> None:
                         msg = (f"🔎 Scan completed: {len(results)} estimated "
                                f"RSI events from the available last 24 hours.\n"
                                "Each event was posted separately in New York time.\n"
-                               "These are 5-second historical approximations, not live alerts.")
+                               "These are Dukascopy-feed historical estimates, not live OANDA alerts.")
                     else:
                         msg = ("🔎 Scan completed. No qualifying RSI 30/70 events "
-                               "were reconstructed from available OANDA S5 history "
+                               "were reconstructed from available Dukascopy tick history "
                                "in the last 24 hours.\nHistorical replay is approximate.")
                     enqueue(conn, f"status:scanfinish:{job_id}", chat_id, msg)
                     conn.execute("UPDATE scan_jobs SET state='done' WHERE id=?",

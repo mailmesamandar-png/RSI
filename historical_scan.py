@@ -1,34 +1,38 @@
-"""Read-only, approximate 24h RSI touch replay from OANDA S5 midpoint candles.
+"""No-account forex historical replay using Dukascopy's public tick feed.
 
-Live strategy: RSI(14) is M5, recomputed intrabar from last completed
-M5 Wilder smoothing and the forming M5 price. ONE 70/30 event per pair until
-the RSI touches 50, which immediately resets the pair (no candle close).
-
-Historical 5-second candles are an APPROXIMATION, not historical ticks.
-Never use scan events to update the live alert model's status or lockout.
+The live TradingView indicator remains OANDA and is NOT changed. Historical
+replay is an estimate using a DIFFERENT broker's midpoint tick prices.
+One RSI 30/70 event per symbol until an intrabar RSI 50 touch resets it.
 """
 from __future__ import annotations
 
 import asyncio
-import os
+import lzma
+import math
+import struct
 import time
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 
 import httpx
 
-PAIR_TO_OANDA = {"EURUSD": "EUR_USD", "USDJPY": "USD_JPY", "EURJPY": "EUR_JPY"}
+
+PAIR_SCALES = {"EURUSD": 100_000.0, "USDJPY": 1_000.0, "EURJPY": 1_000.0}
 NY = ZoneInfo("America/New_York")
-M5_SECONDS = 300
-S5_SECONDS = 5
-RSI_LENGTH = 14
-MAX_WINDOW_SECONDS = 24 * 60 * 60
-SCAN_WARMUP_BARS = 180
+M5_MS = 300_000
+HOUR_MS = 3_600_000
+DAY_MS = 86_400_000
+SCAN_HOURS = 24
+WARMUP_ACTIVE_HOURS = 8
+URLS = (
+    "https://datafeed.dukascopy.com/datafeed",
+    "https://www.dukascopy.com/datafeed",
+)
 
 
 class ScanUnavailable(Exception):
-    """Unavailable OANDA authentication, data, or pricing."""
+    """Cannot complete a historical replay without usable market data."""
 
 
 @dataclass(frozen=True)
@@ -44,226 +48,205 @@ class ScanSignal:
         ).astimezone(NY).strftime("%Y-%m-%d %H:%M:%S %Z")
 
 
-def _timestamp(value: str) -> float:
-    """OANDA uses RFC3339 timestamps, sometimes with 9 digits of fractions."""
-    return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
-
-
-def _utc_string(timestamp: float) -> str:
-    return datetime.fromtimestamp(timestamp, timezone.utc).isoformat(
-        timespec="seconds"
-    ).replace("+00:00", "Z")
-
-
-def _rsi(gain: float, loss: float) -> float:
-    if loss == 0:
-        return 100.0 if gain > 0 else 50.0
-    if gain == 0:
-        return 0.0
-    return 100.0 - 100.0 / (1.0 + gain / loss)
-
-
 class WilderM5:
-    def __init__(self, length: int = RSI_LENGTH) -> None:
+    """Exact Wilder RSI smoothing on completed M5 closes; provisional on ticks."""
+
+    def __init__(self, length: int = 14):
         self.length = length
         self.previous_close: float | None = None
         self.avg_gain: float | None = None
         self.avg_loss: float | None = None
-        self._gains: list[float] = []
-        self._losses: list[float] = []
+        self.gains: list[float] = []
+        self.losses: list[float] = []
 
-    def _delta(self, price: float) -> tuple[float, float]:
+    def _change(self, value: float) -> tuple[float, float]:
         assert self.previous_close is not None
-        diff = price - self.previous_close
-        return max(diff, 0.0), max(-diff, 0.0)
+        delta = value - self.previous_close
+        return max(0.0, delta), max(0.0, -delta)
+
+    def _rsi(self, gain: float, loss: float) -> float:
+        if loss == 0:
+            return 100.0 if gain > 0 else 50.0
+        if gain == 0:
+            return 0.0
+        return 100 - 100 / (1 + gain / loss)
 
     def estimate(self, price: float) -> float | None:
-        """RSI at a sampled tick of the currently forming M5 candle."""
         if self.previous_close is None or self.avg_gain is None:
             return None
-        g, l = self._delta(price)
+        gain, loss = self._change(price)
         n = self.length
-        return _rsi((self.avg_gain * (n - 1) + g) / n,
-                    (self.avg_loss * (n - 1) + l) / n)
+        return self._rsi(
+            (self.avg_gain * (n - 1) + gain) / n,
+            (self.avg_loss * (n - 1) + loss) / n,
+        )
 
-    def commit(self, price: float) -> float | None:
-        """Update Wilder smoothing only once when M5 candle is complete."""
+    def commit(self, close: float) -> float | None:
         if self.previous_close is None:
-            self.previous_close = price
+            self.previous_close = close
             return None
-        gain, loss = self._delta(price)
-        self.previous_close = price
+        gain, loss = self._change(close)
+        self.previous_close = close
         if self.avg_gain is None:
-            self._gains.append(gain)
-            self._losses.append(loss)
-            if len(self._gains) == self.length:
-                self.avg_gain = sum(self._gains) / self.length
-                self.avg_loss = sum(self._losses) / self.length
-                return _rsi(self.avg_gain, self.avg_loss)
-            return None
-        n = self.length
-        self.avg_gain = (self.avg_gain * (n - 1) + gain) / n
-        self.avg_loss = (self.avg_loss * (n - 1) + loss) / n
-        return _rsi(self.avg_gain, self.avg_loss)
+            self.gains.append(gain)
+            self.losses.append(loss)
+            if len(self.gains) >= self.length:
+                self.avg_gain = sum(self.gains[-self.length:]) / self.length
+                self.avg_loss = sum(self.losses[-self.length:]) / self.length
+            else:
+                return None
+        else:
+            n = self.length
+            self.avg_gain = (self.avg_gain * (n - 1) + gain) / n
+            self.avg_loss = (self.avg_loss * (n - 1) + loss) / n
+        return self._rsi(self.avg_gain, self.avg_loss)
 
 
-def _touches(prev: float, current: float, value: int) -> bool:
-    if value == 50:
-        return ((prev < 50 <= current) or (prev > 50 >= current))
-    if value == 70:
-        return prev < 70 <= current
-    return prev > 30 >= current
+def _touch50(prev: float, cur: float) -> bool:
+    return prev < 50 <= cur or prev > 50 >= cur
 
 
-def replay_one(
-    ticker: str,
-    warmup_m5: list[tuple[float, float]],
-    samples_s5: list[tuple[float, float]],
-    start: float,
-    end: float,
-) -> list[ScanSignal]:
-    """Run independent state machine for ONE symbol over S5 sample closes."""
+def replay_one(ticker: str, ticks: list[tuple[int, float]],
+               start_ms: int, end_ms: int) -> list[ScanSignal]:
     calc = WilderM5()
-    prev_rsi: float | None = None
     armed = True
+    prev_rsi: float | None = None
+    bucket: int | None = None
+    prev_close: float | None = None
+    events: list[ScanSignal] = []
 
-    # Approximate the left-edge locked/unlocked state from confirmed M5 bars.
-    # True historic intrabar events before this window are not reconstructible.
-    for ts, price in sorted(warmup_m5):
-        if ts + M5_SECONDS > (int(start // M5_SECONDS) * M5_SECONDS):
-            continue
-        rsi = calc.commit(price)
-        if rsi is None:
-            continue
-        if prev_rsi is not None:
-            if _touches(prev_rsi, rsi, 50):
-                armed = True
-            elif armed and (_touches(prev_rsi, rsi, 70) or
-                            _touches(prev_rsi, rsi, 30)):
-                armed = False
-        prev_rsi = rsi
-
-    current_bucket: int | None = None
-    last_close: float | None = None
-    results: list[ScanSignal] = []
-    for ts, price in sorted(samples_s5):
-        candle_close = ts + S5_SECONDS
-        if candle_close < start or candle_close > end:
-            continue
-        bucket = int(ts // M5_SECONDS)
-        if current_bucket is not None and bucket != current_bucket:
-            assert last_close is not None
-            calc.commit(last_close)
-        current_bucket = bucket
-        last_close = price
+    for event_ms, price in sorted(ticks):
+        if event_ms > end_ms:
+            break
+        next_bucket = event_ms // M5_MS
+        if bucket is not None and next_bucket != bucket:
+            assert prev_close is not None
+            calc.commit(prev_close)
+        bucket = next_bucket
+        prev_close = price
         rsi = calc.estimate(price)
         if rsi is None:
             continue
         if prev_rsi is not None:
-            if _touches(prev_rsi, rsi, 50):
+            # RSI 50 touch immediately resets, regardless of M5 close.
+            if _touch50(prev_rsi, rsi):
                 armed = True
             if armed:
-                level = 70 if _touches(prev_rsi, rsi, 70) else (
-                    30 if _touches(prev_rsi, rsi, 30) else None
-                )
+                level = (70 if prev_rsi < 70 <= rsi else
+                         30 if prev_rsi > 30 >= rsi else None)
                 if level is not None:
-                    results.append(ScanSignal(ticker, level,
-                                              int(round(candle_close * 1000))))
                     armed = False
+                    if start_ms <= event_ms <= end_ms:
+                        events.append(ScanSignal(ticker, level, event_ms))
         prev_rsi = rsi
-    return results
+    return events
 
 
-def _scan_config() -> tuple[str, str]:
-    token = os.getenv("OANDA_API_TOKEN", "").strip()
-    if not token:
-        raise ScanUnavailable(
-            "Historical scan needs OANDA_API_TOKEN in Railway Variables. "
-            "Add a personal OANDA v20 API token there; never send it in Telegram or chat."
-        )
-    env = os.getenv("OANDA_API_ENVIRONMENT", "practice").strip().lower()
-    if env not in ("practice", "live"):
-        raise ScanUnavailable("OANDA_API_ENVIRONMENT must be 'practice' or 'live'.")
-    host = ("https://api-fxpractice.oanda.com" if env == "practice"
-            else "https://api-fxtrade.oanda.com")
-    return token, host
+def _possibly_open(dt: datetime) -> bool:
+    # Conservative weekend screening. Empty hours are still allowed if
+    # provider reports none, and daylight-saving shift may vary by week.
+    day = dt.weekday()
+    if day == 5:
+        return False
+    if day == 6 and dt.hour < 20:
+        return False
+    return True
 
 
-async def _request_candles(
-    client: httpx.AsyncClient, token: str, host: str,
-    instrument: str, params: dict,
-) -> list[dict]:
-    endpoint = f"{host}/v3/instruments/{instrument}/candles"
-    try:
-        response = await client.get(
-            endpoint,
-            headers={"Authorization": f"Bearer {token}", "Accept-Datetime-Format": "RFC3339"},
-            params=params,
-        )
-        if response.status_code in (401, 403):
-            raise ScanUnavailable("OANDA API denied access (401/403). Check the token and practice/live environment in Railway.")
-        if response.status_code == 429:
-            raise ScanUnavailable("OANDA rate limit reached. Please wait and try scanning again.")
-        if response.status_code != 200:
-            raise ScanUnavailable(f"OANDA historical data request failed (HTTP {response.status_code}).")
-        body = response.json()
-        if not isinstance(body.get("candles"), list):
-            raise ScanUnavailable("OANDA response is missing candle data.")
-        return body["candles"]
-    except httpx.TimeoutException as ex:
-        raise ScanUnavailable("OANDA candle retrieval timed out. Try again.") from ex
-    except httpx.RequestError as ex:
-        raise ScanUnavailable("Cannot reach OANDA historical-data server.") from ex
+def _hours_to_read(start_ms: int, end_ms: int) -> list[int]:
+    first = (start_ms // HOUR_MS) * HOUR_MS
+    last = (end_ms // HOUR_MS) * HOUR_MS
+    hours: list[int] = []
+    hour = first
+    while hour <= last:
+        hours.append(hour)
+        hour += HOUR_MS
 
-
-def _parse_candles(items: list[dict]) -> list[tuple[float, float]]:
-    rows: list[tuple[float, float]] = []
-    for item in items:
-        if not item.get("complete", False):
-            continue
-        midpoint = item.get("mid") or {}
-        if midpoint.get("c") is None or item.get("time") is None:
-            continue
-        rows.append((_timestamp(str(item["time"])), float(midpoint["c"])))
-    return rows
-
-
-async def _get_pair(
-    client: httpx.AsyncClient, token: str, host: str,
-    ticker: str, start: float, end: float
-) -> list[ScanSignal]:
-    instrument = PAIR_TO_OANDA[ticker]
-    aligned_start = int(start // M5_SECONDS) * M5_SECONDS
-    warmup = _parse_candles(await _request_candles(
-        client, token, host, instrument,
-        {"granularity": "M5", "price": "M",
-         "count": SCAN_WARMUP_BARS, "to": _utc_string(aligned_start)},
+    # M5 Wilder RSI and the per-symbol lockout need a warmup across
+    # weekends. Collect the preceding 8 potentially active hours,
+    # going back at most 7 days. Do not request empty Saturday files.
+    wanted = WARMUP_ACTIVE_HOURS
+    hour = first - HOUR_MS
+    for _ in range(24 * 7):
+        dt = datetime.fromtimestamp(hour / 1000, timezone.utc)
+        if _possibly_open(dt):
+            hours.append(hour)
+            wanted -= 1
+            if wanted == 0:
+                break
+        hour -= HOUR_MS
+    return sorted(set(
+        h for h in hours
+        if _possibly_open(datetime.fromtimestamp(h / 1000, timezone.utc))
     ))
-    # OANDA permits up to 5000 candles per request. Each 5h partition
-    # contains no more than 3600 S5 bars, even during a 24h open market.
-    raw: dict[float, float] = {}
-    cursor = start
-    while cursor < end:
-        stop = min(cursor + 5 * 60 * 60, end)
-        for t, close in _parse_candles(await _request_candles(
-            client, token, host, instrument,
-            {"granularity": "S5", "price": "M",
-             "from": _utc_string(cursor), "to": _utc_string(stop)},
-        )):
-            raw[t] = close
-        cursor = stop
-    return replay_one(ticker, warmup, sorted(raw.items()), start, end)
+
+
+def _decode_tick_hour(data: bytes, hour_ms: int, scale: float
+                      ) -> list[tuple[int, float]]:
+    try:
+        raw = lzma.decompress(data)
+    except lzma.LZMAError as ex:
+        raise ScanUnavailable("The historical tick feed returned unreadable data.") from ex
+    if len(raw) % 20:
+        raise ScanUnavailable("Historical tick feed has an invalid record size.")
+    samples = []
+    for ms_into_hour, ask, bid, _, _ in struct.iter_unpack(">IIIff", raw):
+        if ms_into_hour >= HOUR_MS or ask == 0 or bid == 0:
+            continue
+        mid = (ask + bid) / (2.0 * scale)
+        if math.isfinite(mid):
+            samples.append((hour_ms + ms_into_hour, mid))
+    return samples
+
+
+async def _read_hour(client: httpx.AsyncClient, semaphore: asyncio.Semaphore,
+                     ticker: str, hour_ms: int) -> list[tuple[int, float]]:
+    dt = datetime.fromtimestamp(hour_ms / 1000, timezone.utc)
+    path = (f"{ticker}/{dt.year}/{dt.month - 1:02d}/"
+            f"{dt.day:02d}/{dt.hour:02d}h_ticks.bi5")
+    async with semaphore:
+        for base in URLS:
+            try:
+                resp = await client.get(f"{base}/{path}", follow_redirects=True)
+                if resp.status_code == 404:
+                    # Closed market / missing file, not a signal.
+                    return []
+                if resp.status_code == 200:
+                    return _decode_tick_hour(resp.content, hour_ms, PAIR_SCALES[ticker])
+                # Try the fallback host on regional or rate-limiting responses.
+            except (httpx.RequestError, httpx.TimeoutException):
+                continue
+    # Failed downloads are not treated as no-signal hours: that would give
+    # misleading backtests with artificial gaps.
+    raise ScanUnavailable("The public historical forex feed is temporarily unreachable.")
 
 
 async def scan_last_24h() -> tuple[list[ScanSignal], float, float]:
-    """Get the available last 24h; weekend/closed hours naturally have no data."""
-    token, host = _scan_config()
-    end = time.time()
-    start = end - MAX_WINDOW_SECONDS
-    timeout = httpx.Timeout(35.0, connect=10.0)
+    """Fetch public Dukascopy ticks for the last available 24h and replay M5 RSI."""
+    end_ms = int(time.time() * 1000)
+    start_ms = end_ms - SCAN_HOURS * 60 * 60 * 1000
+    hours = _hours_to_read(start_ms, end_ms)
+    if not hours:
+        raise ScanUnavailable("No accessible trading hours in the requested period.")
+    semaphore = asyncio.Semaphore(6)
+    timeout = httpx.Timeout(25.0, connect=10.0)
     async with httpx.AsyncClient(timeout=timeout) as client:
-        # Serialized across three pairs to avoid hitting OANDA rate limits.
-        signals = []
-        for ticker in PAIR_TO_OANDA:
-            signals.extend(await _get_pair(client, token, host, ticker, start, end))
-    return sorted(signals, key=lambda v: (v.time_ms, v.ticker)), start, end
+        # Limit memory: download/replay one instrument at a time.
+        results: list[ScanSignal] = []
+        total_ticks = 0
+        for ticker in PAIR_SCALES:
+            hour_data = await asyncio.gather(
+                *(_read_hour(client, semaphore, ticker, hour) for hour in hours)
+            )
+            ticks = [sample for chunk in hour_data for sample in chunk]
+            total_ticks += len(ticks)
+            results.extend(replay_one(ticker, ticks, start_ms, end_ms))
+            del hour_data, ticks
+
+    if total_ticks == 0:
+        raise ScanUnavailable(
+            "No ticks were returned. The market may be closed or historical data "
+            "may not yet have been published."
+        )
+    return sorted(results, key=lambda s: (s.time_ms, s.ticker)), (
+        start_ms / 1000), (end_ms / 1000)

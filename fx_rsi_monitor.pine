@@ -41,7 +41,7 @@ varip int lastEventMs = 0
 // A line touch includes landing exactly on the threshold or moving across it
 // between observed updates. Repeated RSI 70/30 taps while DISARMED are ignored.
 f_touched50(float previous, float current) =>
-    not na(previous) and not na(current) and (current == 50 or (previous < 50 and current >= 50) or (previous > 50 and current <= 50))
+    not na(previous) and not na(current) and ((current == 50 and previous != 50) or (previous < 50 and current >= 50) or (previous > 50 and current <= 50))
 
 bool eurusdReset = barstate.isrealtime and f_touched50(prevEurusdRsi, eurusdRsi)
 bool usdjpyReset = barstate.isrealtime and f_touched50(prevUsdjpyRsi, usdjpyRsi)

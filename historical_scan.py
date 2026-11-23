@@ -327,7 +327,9 @@ async def _read_hour(client: httpx.AsyncClient,
                             ticker, dt.strftime("%Y-%m-%d %H UTC"),
                             len(response.content))
                 break
-            if is_final_hour:
+            # A successful empty file may be an archive not published yet.
+            # Never cache it as permanently empty.
+            if is_final_hour and response.content:
                 try:
                     cached.parent.mkdir(parents=True, exist_ok=True)
                     temp = cached.with_suffix(".tmp")

@@ -21,6 +21,7 @@ from zoneinfo import ZoneInfo
 import httpx
 from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field
+from historical_scan import ScanUnavailable, scan_last_24h
 
 LOG = logging.getLogger("fx_rsi_monitor")
 logging.basicConfig(level=logging.INFO)
@@ -30,9 +31,10 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 PAIRS = ("EURUSD", "USDJPY", "EURJPY")
 NEW_YORK_TZ = ZoneInfo("America/New_York")
 STATUS_BUTTON = "📊 Current Status"
+SCAN_BUTTON = "🔎 Scan Last 24h"
 SIGNAL_RETENTION_MS = 24 * 60 * 60 * 1000
 STATUS_KEYBOARD = {
-    "keyboard": [[{"text": STATUS_BUTTON}]],
+    "keyboard": [[{"text": STATUS_BUTTON}], [{"text": SCAN_BUTTON}]],
     "resize_keyboard": True,
     "one_time_keyboard": False,
     "is_persistent": True,
@@ -125,6 +127,21 @@ def initialize_db() -> None:
             );
             CREATE INDEX IF NOT EXISTS signal_expiry_idx
                 ON signal_messages(expires_at_ms);
+            CREATE TABLE IF NOT EXISTS scan_jobs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                telegram_update_id INTEGER UNIQUE NOT NULL,
+                chat_id INTEGER NOT NULL,
+                requested_at INTEGER NOT NULL,
+                state TEXT NOT NULL DEFAULT 'queued'
+            );
+            CREATE INDEX IF NOT EXISTS scan_jobs_state
+                ON scan_jobs(state,id);
+            CREATE TABLE IF NOT EXISTS replay_messages (
+                chat_id INTEGER NOT NULL,
+                message_id INTEGER NOT NULL,
+                scan_id INTEGER NOT NULL,
+                PRIMARY KEY(chat_id,message_id)
+            );
             """
         )
         conn.commit()
@@ -239,9 +256,24 @@ def handle_telegram_update(data: dict) -> None:
         elif owner != chat_id:
             body = ("This Telegram chat is not paired. Send your private "
                     "pairing command: /start YOUR_PRIVATE_CODE")
+        elif command == "/scan" or text.strip() == SCAN_BUTTON:
+            pending = conn.execute(
+                "SELECT id FROM scan_jobs WHERE chat_id=? AND state IN ('queued','running') LIMIT 1",
+                (chat_id,),
+            ).fetchone()
+            if pending:
+                body = "🔎 A historical scan is already running. Please wait for the results."
+            else:
+                conn.execute(
+                    """INSERT OR IGNORE INTO scan_jobs(telegram_update_id,chat_id,requested_at,state)
+                       VALUES(?,?,?,'queued')""",
+                    (update_id, chat_id, int(time.time())),
+                )
+                body = ("🔎 Scanning available market history from the last 24 hours. "
+                        "Using OANDA 5-second candles to approximate RSI 14 intrabar touches. "
+                        "Results are not live signals.")
         else:
-            # Pressing the persistent keyboard is just another text request.
-            # /status, /ping and user-written requests all produce one status.
+            # The Current Status button and /status preserve existing behavior.
             body = current_status()
 
         # The worker sends this report first; only then it deletes the
@@ -271,6 +303,112 @@ def queue_expired_signals() -> None:
         conn.commit()
 
 
+
+async def historical_scan_worker() -> None:
+    """Serialize user-triggered scans; never block Telegram's webhook handler."""
+    while True:
+        try:
+            with closing(db_connect()) as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                job = conn.execute(
+                    "SELECT id,chat_id FROM scan_jobs WHERE state='queued' "
+                    "ORDER BY id LIMIT 1"
+                ).fetchone()
+                if job:
+                    conn.execute("UPDATE scan_jobs SET state='running' WHERE id=?",
+                                 (job["id"],))
+                conn.commit()
+
+            if job is None:
+                await asyncio.sleep(2)
+                continue
+
+            job_id = job["id"]
+            chat_id = job["chat_id"]
+            try:
+                results, start, end = await scan_last_24h()
+                with closing(db_connect()) as conn:
+                    conn.execute("BEGIN IMMEDIATE")
+                    if paired_chat(conn) != chat_id:
+                        # A former owner must not receive a queued scan after re-pairing.
+                        conn.execute("UPDATE scan_jobs SET state='cancelled' WHERE id=?",
+                                     (job_id,))
+                        conn.commit()
+                        continue
+
+                    # Rescans replace earlier replay messages, never live alerts.
+                    old = conn.execute(
+                        "SELECT message_id FROM replay_messages WHERE chat_id=?",
+                        (chat_id,),
+                    ).fetchall()
+                    for item in old:
+                        mid = item["message_id"]
+                        enqueue(conn, f"delete_replay:{chat_id}:{mid}",
+                                chat_id, str(mid))
+                        conn.execute(
+                            "DELETE FROM signal_messages WHERE chat_id=? AND message_id=?",
+                            (chat_id, mid),
+                        )
+                    conn.execute("DELETE FROM replay_messages WHERE chat_id=?", (chat_id,))
+                    conn.execute("DELETE FROM outbox WHERE chat_id=? AND id LIKE 'replay:%'",
+                                 (chat_id,))
+
+                    for signal in results:
+                        enqueue(
+                            conn,
+                            f"replay:{job_id}:{signal.time_ms}:{signal.ticker}:{signal.level}",
+                            chat_id,
+                            f"🧪 HISTORICAL ESTIMATE (OANDA S5)\n"
+                            f"{signal.ticker} — RSI {signal.level}\n"
+                            f"NY: {signal.ny_time}",
+                        )
+
+                    # Replaces "Scanning ..." while preserving the status keyboard.
+                    if results:
+                        msg = (f"🔎 Scan completed: {len(results)} estimated "
+                               f"RSI events from the available last 24 hours.\n"
+                               "Each event was posted separately in New York time.\n"
+                               "These are 5-second historical approximations, not live alerts.")
+                    else:
+                        msg = ("🔎 Scan completed. No qualifying RSI 30/70 events "
+                               "were reconstructed from available OANDA S5 history "
+                               "in the last 24 hours.\nHistorical replay is approximate.")
+                    enqueue(conn, f"status:scanfinish:{job_id}", chat_id, msg)
+                    conn.execute("UPDATE scan_jobs SET state='done' WHERE id=?",
+                                 (job_id,))
+                    conn.commit()
+                LOG.info("Historical S5 replay finished job=%s event_count=%s",
+                         job_id, len(results))
+            except ScanUnavailable as ex:
+                # Missing credentials, HTTP failures, and API limits are reported
+                # clearly; no fabricated results are posted.
+                with closing(db_connect()) as conn:
+                    conn.execute("BEGIN IMMEDIATE")
+                    if paired_chat(conn) == chat_id:
+                        enqueue(conn, f"status:scanerror:{job_id}", chat_id,
+                                f"🔎 Historical scan unavailable.\n{ex}")
+                    conn.execute("UPDATE scan_jobs SET state='failed' WHERE id=?",
+                                 (job_id,))
+                    conn.commit()
+                LOG.warning("Historical scan unavailable job=%s type=%s",
+                            job_id, type(ex).__name__)
+            except Exception as ex:
+                with closing(db_connect()) as conn:
+                    conn.execute("BEGIN IMMEDIATE")
+                    if paired_chat(conn) == chat_id:
+                        enqueue(conn, f"status:scanerror:{job_id}", chat_id,
+                                "🔎 Historical scan failed unexpectedly. Try again later.")
+                    conn.execute("UPDATE scan_jobs SET state='failed' WHERE id=?",
+                                 (job_id,))
+                    conn.commit()
+                LOG.exception("Historical scan failed job=%s", job_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            LOG.exception("Unexpected historical scan worker error")
+            await asyncio.sleep(5)
+
+
 async def delivery_worker() -> None:
     """Send replaceable status reports and keep only signals from the last 24h."""
     assert config is not None
@@ -288,10 +426,12 @@ async def delivery_worker() -> None:
                 for row in rows:
                     task_id = row["id"]
                     is_delete = task_id.startswith(
-                        ("delete:", "delete_signal:", "delete_request:")
+                        ("delete:", "delete_signal:", "delete_request:", "delete_replay:")
                     )
                     is_status = task_id.startswith("status:")
-                    is_signal = task_id.startswith("rsi:")
+                    is_live_signal = task_id.startswith("rsi:")
+                    is_replay = task_id.startswith("replay:")
+                    is_signal = is_live_signal or is_replay
                     try:
                         if is_delete:
                             response = await client.post(
@@ -308,6 +448,11 @@ async def delivery_worker() -> None:
                                 if not response.json().get("ok"):
                                     raise RuntimeError("Telegram deletion returned not-ok")
                             with closing(db_connect()) as conn:
+                                if task_id.startswith(("delete_replay:", "delete_signal:")):
+                                    conn.execute(
+                                        "DELETE FROM replay_messages WHERE chat_id=? AND message_id=?",
+                                        (row["chat_id"], int(row["body"])),
+                                    )
                                 conn.execute("DELETE FROM outbox WHERE id=?", (task_id,))
                                 conn.commit()
                             continue
@@ -316,7 +461,7 @@ async def delivery_worker() -> None:
                         if is_signal:
                             # Older queued events should never be delivered as
                             # fresh signals once their 24-hour window is over.
-                            event_time_ms = int(task_id.split(":")[1])
+                            event_time_ms = int(task_id.split(":")[2 if is_replay else 1])
                             if event_time_ms + SIGNAL_RETENTION_MS <= int(time.time() * 1000):
                                 with closing(db_connect()) as conn:
                                     conn.execute("DELETE FROM outbox WHERE id=?", (task_id,))
@@ -371,6 +516,13 @@ async def delivery_worker() -> None:
                                     (row["chat_id"], message_id, event_time_ms,
                                      event_time_ms + SIGNAL_RETENTION_MS),
                                 )
+                                if is_replay:
+                                    conn.execute(
+                                        """INSERT OR IGNORE INTO replay_messages(
+                                             chat_id,message_id,scan_id) VALUES(?,?,?)""",
+                                        (row["chat_id"], message_id,
+                                         int(task_id.split(":")[1])),
+                                    )
                             # Legacy 'reply:' messages, if any, are not
                             # deleted automatically because their purpose is unknown.
                             conn.execute("DELETE FROM outbox WHERE id=?", (task_id,))
@@ -401,15 +553,22 @@ async def lifespan(app: FastAPI):
     global config
     config = Config()
     initialize_db()
+    # Recover jobs interrupted by a deployment restart.
+    with closing(db_connect()) as conn:
+        conn.execute("UPDATE scan_jobs SET state='queued' WHERE state='running'")
+        conn.commit()
     worker = asyncio.create_task(delivery_worker())
+    scan_worker = asyncio.create_task(historical_scan_worker())
     try:
         yield
     finally:
+        scan_worker.cancel()
         worker.cancel()
-        try:
-            await worker
-        except asyncio.CancelledError:
-            pass
+        for task in (worker, scan_worker):
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
 
 
 app = FastAPI(title="FX RSI Monitor", docs_url=None, redoc_url=None, lifespan=lifespan)

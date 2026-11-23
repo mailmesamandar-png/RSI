@@ -50,6 +50,9 @@ class H1DoubleSweep(BaseModel):
     both_sides: Literal[True]
 
     def check_logic(self) -> None:
+        # Reject every H1 signal except the three approved Forex pairs.
+        if self.ticker.upper().split(":")[-1] not in PAIRS:
+            raise ValueError("H1 double sweep instrument is not permitted")
         if self.event_time > int(time.time() * 1000) + 120_000:
             raise ValueError("event_time is in the future")
         if self.event_time < int(time.time() * 1000) - 120_000:
@@ -416,9 +419,9 @@ def signal_audit() -> str:
         h1_rows = conn.execute(
             """SELECT ticker, event_time
                FROM h1_double_sweeps
-               WHERE event_time >= ?
+               WHERE event_time >= ? AND (UPPER(ticker) IN (?,?,?) OR UPPER(ticker) LIKE ? OR UPPER(ticker) LIKE ? OR UPPER(ticker) LIKE ?)
                ORDER BY event_time DESC, ticker""",
-            (cutoff_ms,),
+            (cutoff_ms, *PAIRS, *(f"%:{pair}" for pair in PAIRS)),
         ).fetchall()
 
     def ny_stamp(event_time: int) -> str:

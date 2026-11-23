@@ -1,8 +1,9 @@
 //@version=6
-// M5 RSI 14: alert on EVERY fresh intrabar touch of 70 or 30.
-// No 5-minute close required for 30/70. Repeated re-entries are distinct touches.
-// An M5 candle CLOSE is still required for RSI 50 RANGE/reset.
-// Uses realtime tick observations; historical bars cannot reconstruct intrabar touches.
+// RSI 14 on M5: ONE immediate RSI 70/30 signal per pair.
+// Ignore all repeat 70/30 touches until that pair TOUCHES RSI 50 intrabar.
+// Touching 50 immediately resets to RANGE and re-arms the pair.
+// No M5 candle close is required for signal OR reset.
+// Historical OHLC cannot reconstruct intrabar RSI touches.
 indicator("FX RSI 3-Pair Monitor | M5 Intrabar Touches -> Telegram", overlay = true)
 
 string eurusdSymbol = input.symbol("OANDA:EURUSD", "EURUSD feed", group = "FX pairs")
@@ -21,71 +22,123 @@ f_data() =>
 [usdjpyRsi, usdjpy70Close, usdjpy30Close, usdjpy50Close] = request.security(usdjpySymbol, "5", f_data(), gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_off)
 [eurjpyRsi, eurjpy70Close, eurjpy30Close, eurjpy50Close] = request.security(eurjpySymbol, "5", f_data(), gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_off)
 
-// Intrabar persistence is essential: ordinary "var" rolls back on each tick.
-// These previous values update with EVERY chart tick, not with candle closes.
+// Realtime intrabar RSI observation uses varip (no rollback on each chart tick).
 varip float prevEurusdRsi = na
 varip float prevUsdjpyRsi = na
 varip float prevEurjpyRsi = na
 
-// 0=RANGE; 1=BUY (last 70 touch); 2=SELL (last 30 touch).
-// Only a confirmed M5 crossing of 50 returns a pair to RANGE.
-// There is NO 50-level lockout on new 70/30 touches.
+// Each pair has its OWN lockout, released ONLY by touching RSI 50.
+// Every touch is intrabar; no 5-minute candle-close confirmation is required.
+// 0=RANGE (most recent touch was RSI 50), 1=BUY (70), 2=SELL (30).
+varip bool eurusdArmed = true
+varip bool usdjpyArmed = true
+varip bool eurjpyArmed = true
 varip int eurusdState = 0
 varip int usdjpyState = 0
 varip int eurjpyState = 0
 varip int lastEventMs = 0
 
-// On a realtime update, detect the exact new touch from the preceding tick:
-//   below 70 -> >=70; above 30 -> <=30.
-// A second upward touch after dropping back below 70 is a NEW signal,
-// even if the RSI never crossed 50 between the two touches.
-bool eurusdTouch70 = barstate.isrealtime and not na(prevEurusdRsi) and not na(eurusdRsi) and prevEurusdRsi < 70 and eurusdRsi >= 70
-bool eurusdTouch30 = barstate.isrealtime and not na(prevEurusdRsi) and not na(eurusdRsi) and prevEurusdRsi > 30 and eurusdRsi <= 30
-bool usdjpyTouch70 = barstate.isrealtime and not na(prevUsdjpyRsi) and not na(usdjpyRsi) and prevUsdjpyRsi < 70 and usdjpyRsi >= 70
-bool usdjpyTouch30 = barstate.isrealtime and not na(prevUsdjpyRsi) and not na(usdjpyRsi) and prevUsdjpyRsi > 30 and usdjpyRsi <= 30
-bool eurjpyTouch70 = barstate.isrealtime and not na(prevEurjpyRsi) and not na(eurjpyRsi) and prevEurjpyRsi < 70 and eurjpyRsi >= 70
-bool eurjpyTouch30 = barstate.isrealtime and not na(prevEurjpyRsi) and not na(eurjpyRsi) and prevEurjpyRsi > 30 and eurjpyRsi <= 30
+// A line touch includes landing exactly on the threshold or moving across it
+// between observed updates. Repeated RSI 70/30 taps while DISARMED are ignored.
+f_touched50(float previous, float current) =>
+    not na(previous) and not na(current) and (current == 50 or (previous < 50 and current >= 50) or (previous > 50 and current <= 50))
 
-// The 50-level RANGE transition remains candle-close-only.
-if barstate.isconfirmed
+bool eurusdReset = barstate.isrealtime and f_touched50(prevEurusdRsi, eurusdRsi)
+bool usdjpyReset = barstate.isrealtime and f_touched50(prevUsdjpyRsi, usdjpyRsi)
+bool eurjpyReset = barstate.isrealtime and f_touched50(prevEurjpyRsi, eurjpyRsi)
+
+bool eurusdHit70 = barstate.isrealtime and not na(prevEurusdRsi) and prevEurusdRsi < 70 and eurusdRsi >= 70
+bool eurusdHit30 = barstate.isrealtime and not na(prevEurusdRsi) and prevEurusdRsi > 30 and eurusdRsi <= 30
+bool usdjpyHit70 = barstate.isrealtime and not na(prevUsdjpyRsi) and prevUsdjpyRsi < 70 and usdjpyRsi >= 70
+bool usdjpyHit30 = barstate.isrealtime and not na(prevUsdjpyRsi) and prevUsdjpyRsi > 30 and usdjpyRsi <= 30
+bool eurjpyHit70 = barstate.isrealtime and not na(prevEurjpyRsi) and prevEurjpyRsi < 70 and eurjpyRsi >= 70
+bool eurjpyHit30 = barstate.isrealtime and not na(prevEurjpyRsi) and prevEurjpyRsi > 30 and eurjpyRsi <= 30
+
+// Effective alerts, as opposed to mere threshold touches.
+bool eurusdTouch70 = false
+bool eurusdTouch30 = false
+bool usdjpyTouch70 = false
+bool usdjpyTouch30 = false
+bool eurjpyTouch70 = false
+bool eurjpyTouch30 = false
+
+if barstate.isrealtime
+    // First reset each pair that has JUST touched 50, immediately.
+    if eurusdReset
+        eurusdState := 0
+        eurusdArmed := true
+    if usdjpyReset
+        usdjpyState := 0
+        usdjpyArmed := true
+    if eurjpyReset
+        eurjpyState := 0
+        eurjpyArmed := true
+
+    // Exactly one 70 OR 30 signal per pair until its NEXT RSI 50 touch.
+    if eurusdArmed
+        if eurusdHit70
+            eurusdTouch70 := true
+            eurusdState := 1
+            eurusdArmed := false
+        else if eurusdHit30
+            eurusdTouch30 := true
+            eurusdState := 2
+            eurusdArmed := false
+    if usdjpyArmed
+        if usdjpyHit70
+            usdjpyTouch70 := true
+            usdjpyState := 1
+            usdjpyArmed := false
+        else if usdjpyHit30
+            usdjpyTouch30 := true
+            usdjpyState := 2
+            usdjpyArmed := false
+    if eurjpyArmed
+        if eurjpyHit70
+            eurjpyTouch70 := true
+            eurjpyState := 1
+            eurjpyArmed := false
+        else if eurjpyHit30
+            eurjpyTouch30 := true
+            eurjpyState := 2
+            eurjpyArmed := false
+else if barstate.isconfirmed
+    // Historical M5 OHLC cannot reveal intrabar RSI touches. Rebuild the
+    // starting armed/state values from confirmed historical RSI crossings.
+    // THIS DOES NOT impose candle-close confirmation on live signals or reset.
     if eurusd50Close
         eurusdState := 0
+        eurusdArmed := true
     if usdjpy50Close
         usdjpyState := 0
+        usdjpyArmed := true
     if eurjpy50Close
         eurjpyState := 0
+        eurjpyArmed := true
 
-    // Reconstruct a reasonable historical display using M5 closes only.
-    // Historical tick-by-tick 70/30 touches are NOT available to Pine.
-    if not barstate.isrealtime
+    if eurusdArmed
         if eurusd70Close
             eurusdState := 1
-        if eurusd30Close
+            eurusdArmed := false
+        else if eurusd30Close
             eurusdState := 2
+            eurusdArmed := false
+    if usdjpyArmed
         if usdjpy70Close
             usdjpyState := 1
-        if usdjpy30Close
+            usdjpyArmed := false
+        else if usdjpy30Close
             usdjpyState := 2
+            usdjpyArmed := false
+    if eurjpyArmed
         if eurjpy70Close
             eurjpyState := 1
-        if eurjpy30Close
+            eurjpyArmed := false
+        else if eurjpy30Close
             eurjpyState := 2
+            eurjpyArmed := false
 
-// Realtime touches take effect NOW, whether or not the candle is closed.
-if eurusdTouch70
-    eurusdState := 1
-if eurusdTouch30
-    eurusdState := 2
-if usdjpyTouch70
-    usdjpyState := 1
-if usdjpyTouch30
-    usdjpyState := 2
-if eurjpyTouch70
-    eurjpyState := 1
-if eurjpyTouch30
-    eurjpyState := 2
-
-// Save last observed tick RSI AFTER evaluating fresh touches.
+// Update each last-observed RSI after detecting this tick's touches.
 prevEurusdRsi := eurusdRsi
 prevUsdjpyRsi := usdjpyRsi
 prevEurjpyRsi := eurjpyRsi
@@ -107,14 +160,16 @@ if barstate.islast
     table.cell(statusTable, 0, 3, "EURJPY")
     table.cell(statusTable, 1, 3, f_state(eurjpyState), text_color = color.white, bgcolor = f_color(eurjpyState))
 
-// Send an intrabar webhook as soon as ANY new 70/30 touch is observed.
-// ALSO send a silent snapshot on each M5 close so /status stays current.
-// Each snapshot carries all three statuses and zero-to-three touch signals.
+// Send an intrabar webhook for EVERY QUALIFIED 70/30 touch.
+// Send an immediate SILENT snapshot on each 50 touch (for /status).
+// ALSO send a silent snapshot on each M5 close to keep /status current.
+// Each snapshot carries all three states and zero-to-three qualified signals.
 // The "bar_time" field is now the actual realtime event time, not the
 // candle close, so the backend can accept multiple events within one M5 bar.
 // alert.freq_all is REQUIRED; once_per_bar_close would drop extra touches.
 bool hasTouch = eurusdTouch70 or eurusdTouch30 or usdjpyTouch70 or usdjpyTouch30 or eurjpyTouch70 or eurjpyTouch30
-bool emitSnapshot = barstate.isrealtime and (hasTouch or barstate.isconfirmed)
+bool hasReset = eurusdReset or usdjpyReset or eurjpyReset
+bool emitSnapshot = barstate.isrealtime and (hasTouch or hasReset or barstate.isconfirmed)
 if emitSnapshot and not na(eurusdRsi) and not na(usdjpyRsi) and not na(eurjpyRsi)
     string events = ""
     if eurusdTouch70 or eurusdTouch30

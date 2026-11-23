@@ -127,6 +127,10 @@ def initialize_db() -> None:
         conn.execute("PRAGMA journal_mode=WAL")
         conn.executescript(
             """
+            CREATE TABLE IF NOT EXISTS authorized_chats (
+                chat_id INTEGER PRIMARY KEY,
+                paired_at INTEGER NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS settings (
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
@@ -191,12 +195,33 @@ def initialize_db() -> None:
             );
             """
         )
+        # Preserve the previously paired user during the upgrade.
+        old_owner = conn.execute(
+            "SELECT value FROM settings WHERE key='paired_chat'"
+        ).fetchone()
+        if old_owner:
+            conn.execute(
+                "INSERT OR IGNORE INTO authorized_chats(chat_id,paired_at) VALUES(?,?)",
+                (int(old_owner["value"]), int(time.time())),
+            )
         conn.commit()
 
 
+def authorized_chats(conn: sqlite3.Connection) -> list[int]:
+    return [int(row["chat_id"]) for row in conn.execute(
+        "SELECT chat_id FROM authorized_chats ORDER BY paired_at,chat_id"
+    ).fetchall()]
+
+
+def is_authorized(conn: sqlite3.Connection, chat_id: int) -> bool:
+    return conn.execute(
+        "SELECT 1 FROM authorized_chats WHERE chat_id=?", (chat_id,)
+    ).fetchone() is not None
+
+
 def paired_chat(conn: sqlite3.Connection) -> int | None:
-    row = conn.execute("SELECT value FROM settings WHERE key = 'paired_chat'").fetchone()
-    return int(row["value"]) if row else None
+    chats = authorized_chats(conn)
+    return chats[0] if chats else None
 
 
 def enqueue(conn: sqlite3.Connection, unique_id: str, chat_id: int, body: str) -> None:
@@ -230,8 +255,8 @@ def accept_snapshot(snapshot: Snapshot) -> bool:
                received_at=excluded.received_at""",
             (snapshot.bar_time, json.dumps(snapshot.states), int(time.time())),
         )
-        chat_id = paired_chat(conn)
-        if chat_id is not None:
+        recipients = authorized_chats(conn)
+        if recipients:
             for s in snapshot.signals:
                 # Once native V2 pair monitor has reported for a pair,
                 # suppress legacy V1 alerts for that pair to avoid duplicates.
@@ -243,8 +268,9 @@ def accept_snapshot(snapshot: Snapshot) -> bool:
                 # Signal event time is the confirmed M5 close, not the
                 # phone's local Telegram UI time or delayed send time.
                 ny_time = format_signal_time(snapshot.bar_time)
-                enqueue(conn, f"rsi:{snapshot.bar_time}:{s.ticker}:{s.level}",
-                        chat_id, f"{s.ticker} — RSI {s.level}\nNY: {ny_time}")
+                for chat_id in recipients:
+                    enqueue(conn, f"rsi:{snapshot.bar_time}:{s.ticker}:{s.level}:{chat_id}",
+                            chat_id, f"{s.ticker} — RSI {s.level}\nNY: {ny_time}")
         conn.commit()
     if snapshot.signals:
         # Record emitted candidates without chat IDs, tokens or price data.
@@ -252,7 +278,7 @@ def accept_snapshot(snapshot: Snapshot) -> bool:
         LOG.info("M5 signal candidates NY=%s events=%s recipient_paired=%s",
                  format_signal_time(snapshot.bar_time),
                  ",".join(f"{s.ticker}:{s.level}" for s in snapshot.signals),
-                 chat_id is not None)
+                 bool(recipients))
     return True
 
 
@@ -289,14 +315,15 @@ def accept_pair_tick(item: PairSnapshot) -> bool:
                 "RESET50" if item.reset50 else "HEARTBEAT")
         task_id = None
         delivery = "not_applicable"
-        chat_id = paired_chat(conn)
+        recipients = authorized_chats(conn)
         if item.signal_level:
-            if chat_id is not None:
+            if recipients:
                 task_id = (f"rsi:{item.event_time}:{item.ticker}:"
                            f"{item.signal_level}")
                 body = (f"{item.ticker} — RSI {item.signal_level}\n"
                         f"NY: {format_signal_time(item.event_time)}")
-                enqueue(conn, task_id, chat_id, body)
+                for chat_id in recipients:
+                    enqueue(conn, f"{task_id}:{chat_id}", chat_id, body)
                 delivery = "queued"
             else:
                 delivery = "no_paired_chat"
@@ -478,20 +505,26 @@ def handle_telegram_update(data: dict) -> None:
 
     with closing(db_connect()) as conn:
         conn.execute("BEGIN IMMEDIATE")
-        owner = paired_chat(conn)
+        authorized = is_authorized(conn, chat_id)
         category = command if command in ("/start", "/ping", "/status", "/help") else "other"
-        LOG.info("Telegram command=%s paired=%s owner_match=%s",
-                 category, owner is not None, owner == chat_id)
+        LOG.info("Telegram command=%s authorized=%s", category, authorized)
 
         if command == "/start" and hmac.compare_digest(arg, config.pairing_code):
-            conn.execute(
-                """INSERT INTO settings(key,value) VALUES('paired_chat',?)
-                   ON CONFLICT(key) DO UPDATE SET value=excluded.value""",
-                (str(chat_id),),
-            )
-            body = "Connected.\n" + current_status()
-            LOG.info("Telegram pairing accepted.")
-        elif owner != chat_id:
+            if not authorized:
+                count = conn.execute("SELECT COUNT(*) FROM authorized_chats").fetchone()[0]
+                if count >= 7:
+                    body = "All seven authorized user slots are occupied. Contact the bot administrator."
+                else:
+                    conn.execute(
+                        "INSERT INTO authorized_chats(chat_id,paired_at) VALUES(?,?)",
+                        (chat_id, int(time.time())),
+                    )
+                    authorized = True
+                    body = "Connected. You are an authorized user.\\n" + current_status()
+                    LOG.info("Telegram pairing accepted; authorized_users=%d", count + 1)
+            else:
+                body = "Already connected.\\n" + current_status()
+        elif not authorized:
             body = ("This Telegram chat is not paired. Send your private "
                     "pairing command: /start YOUR_PRIVATE_CODE")
         elif command == "/audit" or text.strip() == AUDIT_BUTTON:
@@ -586,10 +619,11 @@ async def delivery_worker() -> None:
                             if event_time_ms + SIGNAL_RETENTION_MS <= int(time.time() * 1000):
                                 with closing(db_connect()) as conn:
                                     if is_live_signal:
+                                        base_task = task_id.rsplit(":", 1)[0]
                                         conn.execute(
                                             "UPDATE pair_audit SET delivery_status='expired' "
-                                            "WHERE task_id=?",
-                                            (task_id,),
+                                            "WHERE task_id=? AND delivery_status='queued'",
+                                            (base_task,),
                                         )
                                     conn.execute("DELETE FROM outbox WHERE id=?", (task_id,))
                                     conn.commit()
@@ -598,7 +632,7 @@ async def delivery_worker() -> None:
                         payload = {"chat_id": row["chat_id"], "text": row["body"]}
                         if is_status:
                             with closing(db_connect()) as conn:
-                                if paired_chat(conn) == row["chat_id"]:
+                                if is_authorized(conn, row["chat_id"]):
                                     payload["reply_markup"] = STATUS_KEYBOARD
 
                         response = await client.post(endpoint + "/sendMessage", json=payload)
@@ -637,13 +671,16 @@ async def delivery_worker() -> None:
                                             row["chat_id"], str(req_message_id))
                             elif is_signal and event_time_ms is not None:
                                 if is_live_signal:
-                                    conn.execute(
-                                        """UPDATE pair_audit SET
-                                               delivery_status='sent',
-                                               telegram_message_id=?
-                                           WHERE task_id=?""",
-                                        (message_id, task_id),
-                                    )
+                                    base_task = task_id.rsplit(":", 1)[0]
+                                    remaining = conn.execute(
+                                        "SELECT COUNT(*) FROM outbox WHERE id LIKE ? AND id != ?",
+                                        (base_task + ":%", task_id),
+                                    ).fetchone()[0]
+                                    if remaining == 0:
+                                        conn.execute(
+                                            "UPDATE pair_audit SET delivery_status='sent' WHERE task_id=?",
+                                            (base_task,),
+                                        )
                                 conn.execute(
                                     """INSERT OR IGNORE INTO signal_messages(
                                          chat_id,message_id,signal_at_ms,expires_at_ms)

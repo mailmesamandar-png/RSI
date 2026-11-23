@@ -16,6 +16,7 @@ from contextlib import asynccontextmanager, closing
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal
+from zoneinfo import ZoneInfo
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
@@ -27,6 +28,7 @@ logging.basicConfig(level=logging.INFO)
 # which would expose the bot token in hosting logs.
 logging.getLogger("httpx").setLevel(logging.WARNING)
 PAIRS = ("EURUSD", "USDJPY", "EURJPY")
+NEW_YORK_TZ = ZoneInfo("America/New_York")
 STATUS_BUTTON = "📊 Current Status"
 SIGNAL_RETENTION_MS = 24 * 60 * 60 * 1000
 STATUS_KEYBOARD = {
@@ -140,6 +142,12 @@ def enqueue(conn: sqlite3.Connection, unique_id: str, chat_id: int, body: str) -
     )
 
 
+def format_signal_time(bar_time_ms: int) -> str:
+    """M5 bar close in New York; America/New_York handles EST/EDT automatically."""
+    closed_utc = datetime.fromtimestamp(bar_time_ms / 1000, tz=timezone.utc)
+    return closed_utc.astimezone(NEW_YORK_TZ).strftime("%Y-%m-%d %H:%M %Z")
+
+
 def accept_snapshot(snapshot: Snapshot) -> bool:
     """Atomic update; out-of-order/duplicate candle snapshots cannot duplicate alerts."""
     snapshot.check_logic()
@@ -161,10 +169,19 @@ def accept_snapshot(snapshot: Snapshot) -> bool:
         chat_id = paired_chat(conn)
         if chat_id is not None:
             for s in snapshot.signals:
-                # Exactly the agreed chat format: no trade direction or interpretation.
+                # Signal event time is the confirmed M5 close, not the
+                # phone's local Telegram UI time or delayed send time.
+                ny_time = format_signal_time(snapshot.bar_time)
                 enqueue(conn, f"rsi:{snapshot.bar_time}:{s.ticker}:{s.level}",
-                        chat_id, f"{s.ticker} — RSI {s.level}")
+                        chat_id, f"{s.ticker} — RSI {s.level}\nNY: {ny_time}")
         conn.commit()
+    if snapshot.signals:
+        # Record emitted candidates without chat IDs, tokens or price data.
+        # Useful when auditing visually observed vs actual qualified crossings.
+        LOG.info("M5 signal candidates NY=%s events=%s recipient_paired=%s",
+                 format_signal_time(snapshot.bar_time),
+                 ",".join(f"{s.ticker}:{s.level}" for s in snapshot.signals),
+                 chat_id is not None)
     return True
 
 

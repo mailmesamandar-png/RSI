@@ -403,24 +403,62 @@ def accept_h1_double_sweep(item: H1DoubleSweep) -> bool:
 
 
 def signal_audit() -> str:
-    """One line per RSI 30/70 signal recorded in the last 24 hours."""
+    """Last 24 hours: RSI crossings above, H1 double sweeps below."""
     cutoff_ms = int(time.time() * 1000) - SIGNAL_RETENTION_MS
     with closing(db_connect()) as conn:
-        rows = conn.execute(
+        rsi_rows = conn.execute(
             """SELECT ticker, event_time, kind
                FROM pair_audit
                WHERE kind IN ('RSI30', 'RSI70') AND event_time >= ?
                ORDER BY event_time DESC, id DESC""",
             (cutoff_ms,),
         ).fetchall()
+        h1_rows = conn.execute(
+            """SELECT ticker, event_time
+               FROM h1_double_sweeps
+               WHERE event_time >= ?
+               ORDER BY event_time DESC, ticker""",
+            (cutoff_ms,),
+        ).fetchall()
 
-    if not rows:
-        return "No RSI 30/70 crossings recorded in the last 24 hours."
+    def ny_stamp(event_time: int) -> str:
+        return datetime.fromtimestamp(
+            event_time / 1000, NEW_YORK_TZ
+        ).strftime("%m-%d %H:%M:%S %Z")
 
-    return "\n".join(
-        f"{row['ticker']} | {row['kind'][3:]} | "
-        f"{datetime.fromtimestamp(row['event_time'] / 1000, NEW_YORK_TZ).strftime('%m-%d %H:%M:%S %Z')}"
-        for row in rows
+    rsi_lines = [
+        f"{row['ticker']} | {row['kind'][3:]} | {ny_stamp(row['event_time'])}"
+        for row in rsi_rows
+    ] or ["No RSI 30/70 crossings in the last 24 hours."]
+
+    h1_lines = [
+        f"{row['ticker']} | H1 DOUBLE SWEEP | {ny_stamp(row['event_time'])}"
+        for row in h1_rows
+    ] or ["No H1 double-sweep setups in the last 24 hours."]
+
+    header = "RSI SIGNALS - LAST 24 HOURS"
+    separator = "\u2500" * 22
+    h1_header = "H1 DOUBLE-SWEEP SETUPS - LAST 24 HOURS"
+
+    # Telegram sendMessage text is limited to 4096 characters. Keep both
+    # sections visible even when there are many events.
+    max_length = 4000
+    fixed_length = len(header) + len(separator) + len(h1_header) + 4
+    budget = max_length - fixed_length
+    sections = [[], []]
+    for index, lines in enumerate((rsi_lines, h1_lines)):
+        for line in lines:
+            remaining = budget - sum(len(s) + 1 for group in sections for s in group)
+            if len(line) + 1 > remaining:
+                sections[index].append("... additional events omitted")
+                break
+            sections[index].append(line)
+    if not sections[1]:
+        sections[1] = ["H1 events omitted due to message length."]
+    return (
+        header + "\n" + "\n".join(sections[0]) + "\n"
+        + separator + "\n" + h1_header + "\n"
+        + "\n".join(sections[1])
     )
 
 

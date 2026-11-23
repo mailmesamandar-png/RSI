@@ -331,26 +331,94 @@ def accept_pair_tick(item: PairSnapshot) -> bool:
 
 
 def signal_audit() -> str:
-    """On-demand summary: verified reset and signal events + delivery."""
+    """Audit health per dedicated chart, qualifying events and delivery."""
+    assert config is not None
     with closing(db_connect()) as conn:
+        feeds = {
+            row["ticker"]: row
+            for row in conn.execute(
+                """SELECT ticker,event_time,state,rsi,source,received_at
+                   FROM pair_latest"""
+            ).fetchall()
+        }
         rows = conn.execute(
             """SELECT ticker,event_time,kind,delivery_status
                FROM pair_audit WHERE kind != 'HEARTBEAT'
-               ORDER BY event_time DESC,id DESC LIMIT 25""",
+               ORDER BY event_time DESC,id DESC LIMIT 20"""
         ).fetchall()
-    if not rows:
-        return ("No dedicated-pair RSI events recorded yet.\n"
-                "Create the three new TradingView alerts to enable the audit.")
-    result = ["📋 RSI EVENT AUDIT — newest first"]
-    for row in rows:
-        when = datetime.fromtimestamp(
+        metrics = conn.execute(
+            """SELECT
+                  COUNT(*) AS count_total,
+                  COALESCE(SUM(CASE WHEN kind IN ('RSI30','RSI70')
+                                    THEN 1 ELSE 0 END),0) AS signals,
+                  COALESCE(SUM(CASE WHEN kind = 'RESET50'
+                                    THEN 1 ELSE 0 END),0) AS resets,
+                  COALESCE(SUM(CASE WHEN kind IN ('RSI30','RSI70')
+                                     AND delivery_status = 'sent'
+                                    THEN 1 ELSE 0 END),0) AS delivered
+               FROM pair_audit
+               WHERE event_time >= ?""",
+            (int(time.time() * 1000) - 24 * 60 * 60 * 1000,),
+        ).fetchone()
+        pending = conn.execute(
+            "SELECT COUNT(*) AS count FROM outbox WHERE id LIKE 'rsi:%'"
+        ).fetchone()["count"]
+
+    age_limit = config.stale_after_minutes * 60
+    now = time.time()
+    lines = ["📋 RSI CONNECTION & EVENT AUDIT",
+             "Last TradingView update for each dedicated M5 chart:"]
+    feed_count = 0
+    fresh_count = 0
+    for ticker in PAIRS:
+        row = feeds.get(ticker)
+        if row is None:
+            lines.append(f"❌ {ticker} — no dedicated V2 heartbeat received")
+            continue
+        feed_count += 1
+        age = max(0, int(now - row["received_at"]))
+        recent = age <= age_limit
+        fresh_count += int(recent)
+        marker = "✅ RECENT" if recent else "⚠️ STALE"
+        stamp = datetime.fromtimestamp(
             row["event_time"] / 1000, NEW_YORK_TZ
-        ).strftime("%m-%d %H:%M:%S %Z")
-        result.append(
-            f"{when} | {row['ticker']} {row['kind']} "
-            f"({row['delivery_status']})"
+        ).strftime("%H:%M:%S %Z")
+        lines.append(
+            f"{marker} {ticker} — {row['state']}, RSI {row['rsi']:.2f}\n"
+            f"  Last event: {stamp} | received {age // 60}m {age % 60}s ago"
         )
-    return "\n".join(result)
+
+    lines.append(
+        f"Last 24h recorded: {metrics['signals']} signals, "
+        f"{metrics['resets']} RSI 50 resets, "
+        f"{metrics['delivered']} signals delivered."
+    )
+    if pending:
+        lines.append(f"⏳ {pending} signal(s) awaiting Telegram delivery.")
+
+    if not rows:
+        if feed_count == len(PAIRS) and fresh_count == len(PAIRS):
+            lines.append(
+                "✅ All 3 dedicated TradingView feeds have recent updates.\n"
+                "No qualifying 30/70 signal or 50 reset has been recorded yet "
+                "since V2 monitoring began. This is not an alert-setup error."
+            )
+        else:
+            lines.append(
+                "No qualifying RSI events have been recorded yet. "
+                "Check the missing/stale pair feeds above."
+            )
+    else:
+        lines.append("Latest observed RSI events (NY):")
+        for item in rows[:12]:
+            stamp = datetime.fromtimestamp(
+                item["event_time"] / 1000, NEW_YORK_TZ
+            ).strftime("%m-%d %H:%M:%S %Z")
+            lines.append(
+                f"{stamp} | {item['ticker']} {item['kind']} "
+                f"({item['delivery_status']})"
+            )
+    return "\n".join(lines)
 
 
 def current_status() -> str:

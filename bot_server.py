@@ -32,9 +32,10 @@ PAIRS = ("EURUSD", "USDJPY", "EURJPY")
 NEW_YORK_TZ = ZoneInfo("America/New_York")
 STATUS_BUTTON = "📊 Current Status"
 SCAN_BUTTON = "🔎 Scan Last 24h"
+AUDIT_BUTTON = "📋 RSI Event Audit"
 SIGNAL_RETENTION_MS = 24 * 60 * 60 * 1000
 STATUS_KEYBOARD = {
-    "keyboard": [[{"text": STATUS_BUTTON}], [{"text": SCAN_BUTTON}]],
+    "keyboard": [[{"text": STATUS_BUTTON}], [{"text": AUDIT_BUTTON}], [{"text": SCAN_BUTTON}]],
     "resize_keyboard": True,
     "one_time_keyboard": False,
     "is_persistent": True,
@@ -46,6 +47,33 @@ class Signal(BaseModel):
     model_config = ConfigDict(extra="forbid")
     ticker: Literal["EURUSD", "USDJPY", "EURJPY"]
     level: Literal[30, 70]
+
+
+class PairSnapshot(BaseModel):
+    """A chart-native, per-symbol TradingView alert including reset audit."""
+    model_config = ConfigDict(extra="forbid")
+    version: Literal[2]
+    ticker: Literal["EURUSD", "USDJPY", "EURJPY"]
+    source: str = Field(min_length=5, max_length=80)
+    event_time: int = Field(gt=1_500_000_000_000)
+    state: Literal["BUY", "SELL", "RANGE"]
+    rsi: float = Field(ge=0, le=100)
+    reset50: bool
+    signal_level: Literal[0, 30, 70]
+
+    def check_logic(self) -> None:
+        if self.source != f"OANDA:{self.ticker}":
+            raise ValueError(
+                f"Use OANDA:{self.ticker} as the chart symbol for matching RSI data"
+            )
+        if self.signal_level == 70 and self.state != "BUY":
+            raise ValueError("70 signal must produce BUY state")
+        if self.signal_level == 30 and self.state != "SELL":
+            raise ValueError("30 signal must produce SELL state")
+        if self.reset50 and not self.signal_level and self.state != "RANGE":
+            raise ValueError("RSI 50 reset must produce RANGE state")
+        if self.event_time > int(time.time() * 1000) + 2 * 60 * 1000:
+            raise ValueError("event_time is in the future")
 
 
 class Snapshot(BaseModel):
@@ -111,6 +139,27 @@ def initialize_db() -> None:
                 states_json TEXT NOT NULL,
                 received_at INTEGER NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS pair_latest (
+                ticker TEXT PRIMARY KEY,
+                event_time INTEGER NOT NULL,
+                state TEXT NOT NULL,
+                rsi REAL NOT NULL,
+                source TEXT NOT NULL,
+                received_at INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS pair_audit (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ticker TEXT NOT NULL,
+                event_time INTEGER NOT NULL,
+                kind TEXT NOT NULL,
+                rsi REAL NOT NULL,
+                state TEXT NOT NULL,
+                source TEXT NOT NULL,
+                task_id TEXT UNIQUE,
+                delivery_status TEXT NOT NULL DEFAULT 'not_applicable',
+                telegram_message_id INTEGER
+            );
+            CREATE INDEX IF NOT EXISTS pair_audit_time_idx ON pair_audit(event_time);
             CREATE TABLE IF NOT EXISTS outbox (
                 id TEXT PRIMARY KEY,
                 chat_id INTEGER NOT NULL,
@@ -186,6 +235,13 @@ def accept_snapshot(snapshot: Snapshot) -> bool:
         chat_id = paired_chat(conn)
         if chat_id is not None:
             for s in snapshot.signals:
+                # Once native V2 pair monitor has reported for a pair,
+                # suppress legacy V1 alerts for that pair to avoid duplicates.
+                native = conn.execute(
+                    "SELECT 1 FROM pair_latest WHERE ticker=?", (s.ticker,)
+                ).fetchone()
+                if native:
+                    continue
                 # Signal event time is the confirmed M5 close, not the
                 # phone's local Telegram UI time or delayed send time.
                 ny_time = format_signal_time(snapshot.bar_time)
@@ -202,19 +258,135 @@ def accept_snapshot(snapshot: Snapshot) -> bool:
     return True
 
 
+def accept_pair_tick(item: PairSnapshot) -> bool:
+    """Store exact per-chart RSI touches, resets and M5 heartbeats.
+
+    The per-ticker timestamp is monotonic. A duplicate webhook cannot
+    schedule a second Telegram alert. Events are durably auditable.
+    """
+    item.check_logic()
+    with closing(db_connect()) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        last = conn.execute(
+            "SELECT event_time FROM pair_latest WHERE ticker=?",
+            (item.ticker,),
+        ).fetchone()
+        if last and item.event_time <= last["event_time"]:
+            conn.rollback()
+            return False
+
+        received_at = int(time.time())
+        conn.execute(
+            """INSERT INTO pair_latest(ticker,event_time,state,rsi,source,received_at)
+               VALUES(?,?,?,?,?,?)
+               ON CONFLICT(ticker) DO UPDATE SET
+                   event_time=excluded.event_time,state=excluded.state,
+                   rsi=excluded.rsi,source=excluded.source,
+                   received_at=excluded.received_at""",
+            (item.ticker, item.event_time, item.state, item.rsi,
+             item.source, received_at),
+        )
+        kind = ("RSI70" if item.signal_level == 70 else
+                "RSI30" if item.signal_level == 30 else
+                "RESET50" if item.reset50 else "HEARTBEAT")
+        task_id = None
+        delivery = "not_applicable"
+        chat_id = paired_chat(conn)
+        if item.signal_level:
+            if chat_id is not None:
+                task_id = (f"rsi:{item.event_time}:{item.ticker}:"
+                           f"{item.signal_level}")
+                body = (f"{item.ticker} — RSI {item.signal_level}\n"
+                        f"NY: {format_signal_time(item.event_time)}")
+                enqueue(conn, task_id, chat_id, body)
+                delivery = "queued"
+            else:
+                delivery = "no_paired_chat"
+        conn.execute(
+            """INSERT INTO pair_audit(
+                   ticker,event_time,kind,rsi,state,source,task_id,delivery_status)
+               VALUES(?,?,?,?,?,?,?,?)""",
+            (item.ticker, item.event_time, kind, item.rsi, item.state,
+             item.source, task_id, delivery),
+        )
+        if item.reset50 and item.signal_level:
+            conn.execute(
+                """INSERT INTO pair_audit(
+                       ticker,event_time,kind,rsi,state,source,delivery_status)
+                   VALUES(?,?,?,?,?,?,'not_applicable')""",
+                (item.ticker, item.event_time, "RESET50", item.rsi,
+                 item.state, item.source),
+            )
+        conn.execute(
+            "DELETE FROM pair_audit WHERE event_time < ?",
+            (item.event_time - 7 * 24 * 60 * 60 * 1000,),
+        )
+        conn.commit()
+
+    if kind != "HEARTBEAT" or item.reset50:
+        LOG.info(
+            "RSI pair event=%s ticker=%s NY=%s rsi=%.3f delivery=%s",
+            kind, item.ticker, format_signal_time(item.event_time),
+            item.rsi, delivery,
+        )
+    return True
+
+
+def signal_audit() -> str:
+    """On-demand summary: verified reset and signal events + delivery."""
+    with closing(db_connect()) as conn:
+        rows = conn.execute(
+            """SELECT ticker,event_time,kind,delivery_status
+               FROM pair_audit WHERE kind != 'HEARTBEAT'
+               ORDER BY event_time DESC,id DESC LIMIT 25""",
+        ).fetchall()
+    if not rows:
+        return ("No dedicated-pair RSI events recorded yet.\n"
+                "Create the three new TradingView alerts to enable the audit.")
+    result = ["📋 RSI EVENT AUDIT — newest first"]
+    for row in rows:
+        when = datetime.fromtimestamp(
+            row["event_time"] / 1000, NEW_YORK_TZ
+        ).strftime("%m-%d %H:%M:%S %Z")
+        result.append(
+            f"{when} | {row['ticker']} {row['kind']} "
+            f"({row['delivery_status']})"
+        )
+    return "\n".join(result)
+
+
 def current_status() -> str:
+    """Use native per-pair monitor states when available; show stale feeds."""
     assert config is not None
     with closing(db_connect()) as conn:
-        row = conn.execute("SELECT bar_time,states_json,received_at FROM latest WHERE id=1").fetchone()
-    if not row:
-        return "Waiting for the first confirmed M5 update from TradingView."
-    states = json.loads(row["states_json"])
-    report = "\n".join(f"{pair} — {states[pair]}" for pair in PAIRS)
-    freshness_minutes = (time.time() * 1000 - row["bar_time"]) / 60_000
-    if freshness_minutes > config.stale_after_minutes:
-        utc = datetime.fromtimestamp(row["bar_time"] / 1000, timezone.utc)
-        report += "\n⚠️ STALE DATA — last M5 bar: " + utc.strftime("%Y-%m-%d %H:%M UTC")
-    return report
+        old = conn.execute(
+            "SELECT bar_time,states_json FROM latest WHERE id=1"
+        ).fetchone()
+        native = {
+            row["ticker"]: row
+            for row in conn.execute(
+                "SELECT ticker,event_time,state,rsi,received_at FROM pair_latest"
+            ).fetchall()
+        }
+    old_states = json.loads(old["states_json"]) if old else {}
+    lines = []
+    now_ms = int(time.time() * 1000)
+    stale = []
+    for ticker in PAIRS:
+        row = native.get(ticker)
+        if row:
+            lines.append(f"{ticker} — {row['state']} (RSI {row['rsi']:.2f})")
+            if now_ms - row["event_time"] > config.stale_after_minutes * 60_000:
+                stale.append(ticker)
+        elif ticker in old_states:
+            lines.append(f"{ticker} — {old_states[ticker]} (legacy monitor)")
+            if now_ms - old["bar_time"] > config.stale_after_minutes * 60_000:
+                stale.append(ticker)
+        else:
+            lines.append(f"{ticker} — WAITING FOR FIRST UPDATE")
+    if stale:
+        lines.append("⚠️ STALE MONITOR: " + ", ".join(stale))
+    return "\n".join(lines)
 
 
 def handle_telegram_update(data: dict) -> None:
@@ -256,6 +428,8 @@ def handle_telegram_update(data: dict) -> None:
         elif owner != chat_id:
             body = ("This Telegram chat is not paired. Send your private "
                     "pairing command: /start YOUR_PRIVATE_CODE")
+        elif command == "/audit" or text.strip() == AUDIT_BUTTON:
+            body = signal_audit()
         elif command == "/scan" or text.strip() == SCAN_BUTTON:
             pending = conn.execute(
                 "SELECT id FROM scan_jobs WHERE chat_id=? AND state IN ('queued','running') LIMIT 1",
@@ -464,6 +638,12 @@ async def delivery_worker() -> None:
                             event_time_ms = int(task_id.split(":")[2 if is_replay else 1])
                             if event_time_ms + SIGNAL_RETENTION_MS <= int(time.time() * 1000):
                                 with closing(db_connect()) as conn:
+                                    if is_live_signal:
+                                        conn.execute(
+                                            "UPDATE pair_audit SET delivery_status='expired' "
+                                            "WHERE task_id=?",
+                                            (task_id,),
+                                        )
                                     conn.execute("DELETE FROM outbox WHERE id=?", (task_id,))
                                     conn.commit()
                                 continue
@@ -509,6 +689,14 @@ async def delivery_worker() -> None:
                                             f"delete_request:{row['chat_id']}:{req_message_id}",
                                             row["chat_id"], str(req_message_id))
                             elif is_signal and event_time_ms is not None:
+                                if is_live_signal:
+                                    conn.execute(
+                                        """UPDATE pair_audit SET
+                                               delivery_status='sent',
+                                               telegram_message_id=?
+                                           WHERE task_id=?""",
+                                        (message_id, task_id),
+                                    )
                                 conn.execute(
                                     """INSERT OR IGNORE INTO signal_messages(
                                          chat_id,message_id,signal_at_ms,expires_at_ms)
@@ -580,17 +768,25 @@ async def health():
 
 
 @app.post("/tradingview/{secret}")
-async def tradingview_webhook(secret: str, snapshot: Snapshot, request: Request):
+async def tradingview_webhook(secret: str, request: Request):
     assert config is not None
     if not hmac.compare_digest(secret, config.tradingview_webhook_secret):
         raise HTTPException(status_code=403, detail="Forbidden")
     if int(request.headers.get("content-length", "0")) > 8000:
         raise HTTPException(status_code=413, detail="Payload too large")
     try:
+        payload = await request.json()
+        if not isinstance(payload, dict):
+            raise ValueError("Expected JSON object")
+        if payload.get("version") == 2:
+            tick = PairSnapshot.model_validate(payload)
+            accepted = accept_pair_tick(tick)
+            return {"ok": True, "new_event": accepted}
+        snapshot = Snapshot.model_validate(payload)
         updated = accept_snapshot(snapshot)
-    except ValueError as ex:
-        raise HTTPException(status_code=422, detail=str(ex)) from ex
-    return {"ok": True, "new_candle": updated}
+        return {"ok": True, "new_candle": updated}
+    except Exception as ex:
+        raise HTTPException(status_code=422, detail=type(ex).__name__) from ex
 
 
 @app.post("/telegram")

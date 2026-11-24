@@ -162,6 +162,11 @@ def initialize_db() -> None:
                 telegram_message_id INTEGER
             );
             CREATE INDEX IF NOT EXISTS pair_audit_time_idx ON pair_audit(event_time);
+            CREATE TABLE IF NOT EXISTS rsi_signal_gate (
+                ticker TEXT PRIMARY KEY,
+                last_signal_ms INTEGER NOT NULL DEFAULT 0,
+                last_reset_ms INTEGER NOT NULL DEFAULT 0
+            );
             CREATE TABLE IF NOT EXISTS outbox (
                 id TEXT PRIMARY KEY,
                 chat_id INTEGER NOT NULL,
@@ -202,6 +207,25 @@ def initialize_db() -> None:
             "(body LIKE '%H1 DOUBLE SWEEP%' OR body LIKE '%H1 DOUBLE-SWEEP%')"
         )
         conn.execute("DROP TABLE IF EXISTS h1_double_sweeps")
+        # Seed persistent RSI 50-reset gates from existing audit history.
+        # A new or unknown symbol is disarmed until an explicit reset50 event.
+        for ticker in PAIRS:
+            last_signal = conn.execute(
+                "SELECT MAX(event_time) FROM pair_audit "
+                "WHERE ticker=? AND kind IN ('RSI30','RSI70') "
+                "AND delivery_status!='suppressed_no_50_reset'",
+                (ticker,),
+            ).fetchone()[0] or 0
+            last_reset = conn.execute(
+                "SELECT MAX(event_time) FROM pair_audit "
+                "WHERE ticker=? AND kind='RESET50'",
+                (ticker,),
+            ).fetchone()[0] or 0
+            conn.execute(
+                "INSERT OR IGNORE INTO rsi_signal_gate "
+                "(ticker,last_signal_ms,last_reset_ms) VALUES(?,?,?)",
+                (ticker, last_signal, last_reset),
+            )
         # Preserve the previously paired user during the upgrade.
         old_owner = conn.execute(
             "SELECT value FROM settings WHERE key='paired_chat'"
@@ -323,17 +347,36 @@ def accept_pair_tick(item: PairSnapshot) -> bool:
         task_id = None
         delivery = "not_applicable"
         recipients = authorized_chats(conn)
+        gate = conn.execute(
+            "SELECT last_signal_ms,last_reset_ms FROM rsi_signal_gate WHERE ticker=?",
+            (item.ticker,),
+        ).fetchone()
+        # Only an earlier, explicit 50-level reset can rearm another alert.
+        # In particular, hovering around 70 cannot produce repeated signals.
+        if item.reset50 and not item.signal_level:
+            conn.execute(
+                "UPDATE rsi_signal_gate SET last_reset_ms=? WHERE ticker=?",
+                (item.event_time, item.ticker),
+            )
         if item.signal_level:
-            if recipients:
-                task_id = (f"rsi:{item.event_time}:{item.ticker}:"
-                           f"{item.signal_level}")
-                body = (f"{item.ticker} — RSI {item.signal_level}\n"
-                        f"NY: {format_signal_time(item.event_time)}")
-                for chat_id in recipients:
-                    enqueue(conn, f"{task_id}:{chat_id}", chat_id, body)
-                delivery = "queued"
+            armed = bool(gate and gate["last_reset_ms"] > gate["last_signal_ms"])
+            if armed:
+                conn.execute(
+                    "UPDATE rsi_signal_gate SET last_signal_ms=? WHERE ticker=?",
+                    (item.event_time, item.ticker),
+                )
+                if recipients:
+                    task_id = (f"rsi:{item.event_time}:{item.ticker}:"
+                               f"{item.signal_level}")
+                    body = (f"{item.ticker} — RSI {item.signal_level}\n"
+                            f"NY: {format_signal_time(item.event_time)}")
+                    for chat_id in recipients:
+                        enqueue(conn, f"{task_id}:{chat_id}", chat_id, body)
+                    delivery = "queued"
+                else:
+                    delivery = "no_paired_chat"
             else:
-                delivery = "no_paired_chat"
+                delivery = "suppressed_no_50_reset"
         conn.execute(
             """INSERT INTO pair_audit(
                    ticker,event_time,kind,rsi,state,source,task_id,delivery_status)
@@ -372,6 +415,7 @@ def signal_audit() -> str:
             """SELECT ticker, event_time, kind
                FROM pair_audit
                WHERE kind IN ('RSI30', 'RSI70') AND event_time >= ?
+                 AND delivery_status != 'suppressed_no_50_reset'
                ORDER BY event_time DESC, id DESC""",
             (cutoff_ms,),
         ).fetchall()

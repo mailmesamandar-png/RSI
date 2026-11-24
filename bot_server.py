@@ -41,24 +41,6 @@ STATUS_KEYBOARD = {
 
 
 
-class H1DoubleSweep(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    event_type: Literal["H1_DOUBLE_SWEEP"]
-    ticker: str = Field(min_length=3, max_length=80)
-    event_time: int = Field(gt=1_500_000_000_000)
-    timeframe: Literal["60"]
-    both_sides: Literal[True]
-
-    def check_logic(self) -> None:
-        # Reject every H1 signal except the three approved Forex pairs.
-        if self.ticker.upper().split(":")[-1] not in PAIRS:
-            raise ValueError("H1 double sweep instrument is not permitted")
-        if self.event_time > int(time.time() * 1000) + 120_000:
-            raise ValueError("event_time is in the future")
-        if self.event_time < int(time.time() * 1000) - 120_000:
-            raise ValueError("event_time is too old")
-
-
 class Signal(BaseModel):
     model_config = ConfigDict(extra="forbid")
     ticker: Literal["EURUSD", "USDJPY", "EURJPY"]
@@ -180,12 +162,6 @@ def initialize_db() -> None:
                 telegram_message_id INTEGER
             );
             CREATE INDEX IF NOT EXISTS pair_audit_time_idx ON pair_audit(event_time);
-            CREATE TABLE IF NOT EXISTS h1_double_sweeps (
-                ticker TEXT NOT NULL,
-                hour_key INTEGER NOT NULL,
-                event_time INTEGER NOT NULL,
-                PRIMARY KEY(ticker, hour_key)
-            );
             CREATE TABLE IF NOT EXISTS outbox (
                 id TEXT PRIMARY KEY,
                 chat_id INTEGER NOT NULL,
@@ -219,6 +195,13 @@ def initialize_db() -> None:
             );
             """
         )
+        # Purge retired non-RSI alerts, queued mixed audits and stored setup data.
+        conn.execute("DELETE FROM outbox WHERE id LIKE 'h1double:%'")
+        conn.execute(
+            "DELETE FROM outbox WHERE id LIKE 'status:%' AND "
+            "(body LIKE '%H1 DOUBLE SWEEP%' OR body LIKE '%H1 DOUBLE-SWEEP%')"
+        )
+        conn.execute("DROP TABLE IF EXISTS h1_double_sweeps")
         # Preserve the previously paired user during the upgrade.
         old_owner = conn.execute(
             "SELECT value FROM settings WHERE key='paired_chat'"
@@ -381,87 +364,25 @@ def accept_pair_tick(item: PairSnapshot) -> bool:
     return True
 
 
-def accept_h1_double_sweep(item: H1DoubleSweep) -> bool:
-    """One notification per symbol per UTC hour, separate from RSI events."""
-    item.check_logic()
-    hour_key = item.event_time // 3_600_000
-    with closing(db_connect()) as conn:
-        conn.execute("BEGIN IMMEDIATE")
-        cursor = conn.execute(
-            "INSERT OR IGNORE INTO h1_double_sweeps(ticker,hour_key,event_time) VALUES(?,?,?)",
-            (item.ticker, hour_key, item.event_time),
-        )
-        if cursor.rowcount == 0:
-            conn.rollback()
-            return False
-        ny_time = format_signal_time(item.event_time)
-        for chat_id in authorized_chats(conn):
-            enqueue(conn, f"h1double:{item.ticker}:{hour_key}:{chat_id}",
-                    chat_id, f"H1 DOUBLE SWEEP | {item.ticker} | {ny_time}")
-        conn.execute("DELETE FROM h1_double_sweeps WHERE event_time < ?",
-                     (int(time.time() * 1000) - 7 * 86_400_000,))
-        conn.commit()
-    LOG.info("H1 double sweep accepted ticker=%s", item.ticker)
-    return True
-
-
 def signal_audit() -> str:
-    """Last 24 hours: RSI crossings above, H1 double sweeps below."""
+    """One line per RSI 30/70 signal recorded in the last 24 hours."""
     cutoff_ms = int(time.time() * 1000) - SIGNAL_RETENTION_MS
     with closing(db_connect()) as conn:
-        rsi_rows = conn.execute(
+        rows = conn.execute(
             """SELECT ticker, event_time, kind
                FROM pair_audit
                WHERE kind IN ('RSI30', 'RSI70') AND event_time >= ?
                ORDER BY event_time DESC, id DESC""",
             (cutoff_ms,),
         ).fetchall()
-        h1_rows = conn.execute(
-            """SELECT ticker, event_time
-               FROM h1_double_sweeps
-               WHERE event_time >= ? AND (UPPER(ticker) IN (?,?,?) OR UPPER(ticker) LIKE ? OR UPPER(ticker) LIKE ? OR UPPER(ticker) LIKE ?)
-               ORDER BY event_time DESC, ticker""",
-            (cutoff_ms, *PAIRS, *(f"%:{pair}" for pair in PAIRS)),
-        ).fetchall()
 
-    def ny_stamp(event_time: int) -> str:
-        return datetime.fromtimestamp(
-            event_time / 1000, NEW_YORK_TZ
-        ).strftime("%m-%d %H:%M:%S %Z")
+    if not rows:
+        return "No RSI 30/70 crossings recorded in the last 24 hours."
 
-    rsi_lines = [
-        f"{row['ticker']} | {row['kind'][3:]} | {ny_stamp(row['event_time'])}"
-        for row in rsi_rows
-    ] or ["No RSI 30/70 crossings in the last 24 hours."]
-
-    h1_lines = [
-        f"{row['ticker']} | H1 DOUBLE SWEEP | {ny_stamp(row['event_time'])}"
-        for row in h1_rows
-    ] or ["No H1 double-sweep setups in the last 24 hours."]
-
-    header = "RSI SIGNALS - LAST 24 HOURS"
-    separator = "\u2500" * 22
-    h1_header = "H1 DOUBLE-SWEEP SETUPS - LAST 24 HOURS"
-
-    # Telegram sendMessage text is limited to 4096 characters. Keep both
-    # sections visible even when there are many events.
-    max_length = 4000
-    fixed_length = len(header) + len(separator) + len(h1_header) + 4
-    budget = max_length - fixed_length
-    sections = [[], []]
-    for index, lines in enumerate((rsi_lines, h1_lines)):
-        for line in lines:
-            remaining = budget - sum(len(s) + 1 for group in sections for s in group)
-            if len(line) + 1 > remaining:
-                sections[index].append("... additional events omitted")
-                break
-            sections[index].append(line)
-    if not sections[1]:
-        sections[1] = ["H1 events omitted due to message length."]
-    return (
-        header + "\n" + "\n".join(sections[0]) + "\n"
-        + separator + "\n" + h1_header + "\n"
-        + "\n".join(sections[1])
+    return "\n".join(
+        f"{row['ticker']} | {row['kind'][3:]} | "
+        f"{datetime.fromtimestamp(row['event_time'] / 1000, NEW_YORK_TZ).strftime('%m-%d %H:%M:%S %Z')}"
+        for row in rows
     )
 
 
@@ -779,10 +700,6 @@ async def tradingview_webhook(secret: str, request: Request):
         payload = await request.json()
         if not isinstance(payload, dict):
             raise ValueError("Expected JSON object")
-        if payload.get("event_type") == "H1_DOUBLE_SWEEP":
-            sweep = H1DoubleSweep.model_validate(payload)
-            accepted = accept_h1_double_sweep(sweep)
-            return {"ok": True, "new_event": accepted}
         if payload.get("version") == 2:
             tick = PairSnapshot.model_validate(payload)
             accepted = accept_pair_tick(tick)

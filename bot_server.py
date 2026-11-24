@@ -323,7 +323,7 @@ def accept_pair_tick(item: PairSnapshot) -> bool:
     with closing(db_connect()) as conn:
         conn.execute("BEGIN IMMEDIATE")
         last = conn.execute(
-            "SELECT event_time FROM pair_latest WHERE ticker=?",
+            "SELECT event_time,rsi FROM pair_latest WHERE ticker=?",
             (item.ticker,),
         ).fetchone()
         if last and item.event_time <= last["event_time"]:
@@ -351,12 +351,44 @@ def accept_pair_tick(item: PairSnapshot) -> bool:
             "SELECT last_signal_ms,last_reset_ms FROM rsi_signal_gate WHERE ticker=?",
             (item.ticker,),
         ).fetchone()
-        # Only an earlier, explicit 50-level reset can rearm another alert.
-        # In particular, hovering around 70 cannot produce repeated signals.
-        if item.reset50 and not item.signal_level:
+        # Rearm only when RSI genuinely returns through the 50 midline.
+        # The Pine reset50 flag provides intrabar crossings; consecutive RSI
+        # readings provide an independent fallback for missing reset50 events.
+        inferred_reset = False
+        if not item.signal_level and not item.reset50 and gate and last:
+            previous_rsi = float(last["rsi"])
+            latest_rsi = float(item.rsi)
+            if gate["last_signal_ms"] > 0:
+                previous_signal = conn.execute(
+                    "SELECT kind FROM pair_audit "
+                    "WHERE ticker=? AND event_time=? "
+                    "AND kind IN ('RSI30','RSI70') "
+                    "AND delivery_status!='suppressed_no_50_reset' "
+                    "ORDER BY id DESC LIMIT 1",
+                    (item.ticker, gate["last_signal_ms"]),
+                ).fetchone()
+                if previous_signal:
+                    if previous_signal["kind"] == "RSI70":
+                        inferred_reset = previous_rsi > 50 >= latest_rsi
+                    else:
+                        inferred_reset = previous_rsi < 50 <= latest_rsi
+            elif gate["last_reset_ms"] == 0:
+                inferred_reset = (
+                    (previous_rsi > 50 >= latest_rsi)
+                    or (previous_rsi < 50 <= latest_rsi)
+                )
+        if (item.reset50 or inferred_reset) and not item.signal_level:
             conn.execute(
                 "UPDATE rsi_signal_gate SET last_reset_ms=? WHERE ticker=?",
                 (item.event_time, item.ticker),
+            )
+        if inferred_reset:
+            conn.execute(
+                "INSERT INTO pair_audit "
+                "(ticker,event_time,kind,rsi,state,source,delivery_status) "
+                "VALUES(?,?,?,?,?,?,'not_applicable')",
+                (item.ticker, item.event_time, "RESET50", item.rsi,
+                 item.state, item.source),
             )
         if item.signal_level:
             armed = bool(gate and gate["last_reset_ms"] > gate["last_signal_ms"])
@@ -398,6 +430,9 @@ def accept_pair_tick(item: PairSnapshot) -> bool:
         )
         conn.commit()
 
+    if inferred_reset:
+        LOG.info("RSI 50 reset inferred from readings ticker=%s NY=%s",
+                 item.ticker, format_signal_time(item.event_time))
     if kind != "HEARTBEAT" or item.reset50:
         LOG.info(
             "RSI pair event=%s ticker=%s NY=%s rsi=%.3f delivery=%s",

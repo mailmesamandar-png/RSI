@@ -56,8 +56,18 @@ class ADXReading(BaseModel):
         # Different NASDAQ-family contracts share one NASDAQ signal gate.
         if ":" not in self.source:
             raise ValueError("source must include an exchange/broker prefix")
-        if self.ticker != "NASDAQ" and self.source.split(":")[-1] != self.ticker:
-            raise ValueError("source instrument does not match ticker")
+        approved_feeds = {
+            "XAUUSD": "VANTAGE:XAUUSD",
+            "BTCUSD": "CRYPTO:BTCUSD",
+            "EURUSD": "FX_IDC:EURUSD",
+            "USDJPY": "FX_IDC:USDJPY",
+            "EURJPY": "FX_IDC:EURJPY",
+        }
+        if self.ticker == "NASDAQ":
+            if not self.source.startswith("IG:"):
+                raise ValueError("NASDAQ must use the selected IG symbol")
+        elif self.source != approved_feeds[self.ticker]:
+            raise ValueError("source does not match selected ADX data provider")
         if self.bar_time > int(time.time() * 1000) + 2 * 60 * 1000:
             raise ValueError("bar_time is in the future")
 
@@ -218,18 +228,22 @@ def accept_adx_reading(item: ADXReading) -> bool:
     with closing(db_connect()) as conn:
         conn.execute("BEGIN IMMEDIATE")
         prior = conn.execute(
-            "SELECT bar_time,adx,armed FROM adx_latest WHERE ticker=?",
+            "SELECT bar_time,adx,armed,source FROM adx_latest WHERE ticker=?",
             (item.ticker,),
         ).fetchone()
         if prior and item.bar_time <= prior["bar_time"]:
             conn.rollback()
             return False
 
-        armed = (int(prior["armed"]) if prior else int(item.adx < 30))
-        kind = "INITIAL" if prior is None else "HEARTBEAT"
+        source_changed = bool(prior and prior["source"] != item.source)
+        # A new provider has different ADX history: establish a fresh
+        # baseline, never manufacture a crossing from unlike price feeds.
+        armed = (int(prior["armed"]) if prior and not source_changed
+                 else int(item.adx < 30))
+        kind = "INITIAL" if prior is None or source_changed else "HEARTBEAT"
         delivery = "not_applicable"
         task_id = None
-        if prior:
+        if prior and not source_changed:
             previous = float(prior["adx"])
             if item.adx < 30:
                 if not armed:

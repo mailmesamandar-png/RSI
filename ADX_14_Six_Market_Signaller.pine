@@ -6,7 +6,7 @@ indicator("ADX 14 | Six-Market Telegram Signaller", shorttitle="ADX30 Six Market
 // Backend sends one alert on rising ADX 30 crossing, rearms below 30.
 // This script never sends a direction or a falling-cross alert.
 
-string nasdaqSymbol = input.string("OANDA:NAS100USD", "NASDAQ family member", options=["OANDA:NAS100USD", "FOREXCOM:NAS100", "CAPITALCOM:US100", "CME_MINI:NQ1!", "CME_MINI:MNQ1!", "PEPPERSTONE:NAS100"], group="NASDAQ Family")
+string nasdaqSymbol = input.symbol("IG:NASDAQ", "NASDAQ family member (IG)", group="NASDAQ Family")
 string displayed = input.string("Chart symbol", "Display ADX for", options=["Chart symbol", "XAUUSD", "NASDAQ", "BTCUSD", "EURUSD", "USDJPY", "EURJPY"], group="Chart")
 const int adxLength = 14
 const float level = 30.0
@@ -66,42 +66,42 @@ varip int lastEurJpy = na
 bool smallChart = timeframe.in_seconds(timeframe.period) <= 300
 
 if smallChart
-    [aGold, tGold] = request.security("OANDA:XAUUSD", "5", f_confirmedM5(), gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_on, ignore_invalid_symbol=true)
+    [aGold, tGold] = request.security("VANTAGE:XAUUSD", "5", f_confirmedM5(), gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_on, ignore_invalid_symbol=true)
     [aNasdaq, tNasdaq] = request.security(nasdaqSymbol, "5", f_confirmedM5(), gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_on, ignore_invalid_symbol=true)
-    [aBitcoin, tBitcoin] = request.security("BITSTAMP:BTCUSD", "5", f_confirmedM5(), gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_on, ignore_invalid_symbol=true)
-    [aEurUsd, tEurUsd] = request.security("OANDA:EURUSD", "5", f_confirmedM5(), gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_on, ignore_invalid_symbol=true)
-    [aUsdJpy, tUsdJpy] = request.security("OANDA:USDJPY", "5", f_confirmedM5(), gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_on, ignore_invalid_symbol=true)
-    [aEurJpy, tEurJpy] = request.security("OANDA:EURJPY", "5", f_confirmedM5(), gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_on, ignore_invalid_symbol=true)
-    lastGold := f_forward("XAUUSD", "OANDA:XAUUSD", aGold, tGold, lastGold)
+    [aBitcoin, tBitcoin] = request.security("CRYPTO:BTCUSD", "5", f_confirmedM5(), gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_on, ignore_invalid_symbol=true)
+    [aEurUsd, tEurUsd] = request.security("FX_IDC:EURUSD", "5", f_confirmedM5(), gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_on, ignore_invalid_symbol=true)
+    [aUsdJpy, tUsdJpy] = request.security("FX_IDC:USDJPY", "5", f_confirmedM5(), gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_on, ignore_invalid_symbol=true)
+    [aEurJpy, tEurJpy] = request.security("FX_IDC:EURJPY", "5", f_confirmedM5(), gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_on, ignore_invalid_symbol=true)
+    lastGold := f_forward("XAUUSD", "VANTAGE:XAUUSD", aGold, tGold, lastGold)
     lastNasdaq := f_forward("NASDAQ", nasdaqSymbol, aNasdaq, tNasdaq, lastNasdaq)
-    lastBitcoin := f_forward("BTCUSD", "BITSTAMP:BTCUSD", aBitcoin, tBitcoin, lastBitcoin)
-    lastEurUsd := f_forward("EURUSD", "OANDA:EURUSD", aEurUsd, tEurUsd, lastEurUsd)
-    lastUsdJpy := f_forward("USDJPY", "OANDA:USDJPY", aUsdJpy, tUsdJpy, lastUsdJpy)
-    lastEurJpy := f_forward("EURJPY", "OANDA:EURJPY", aEurJpy, tEurJpy, lastEurJpy)
+    lastBitcoin := f_forward("BTCUSD", "CRYPTO:BTCUSD", aBitcoin, tBitcoin, lastBitcoin)
+    lastEurUsd := f_forward("EURUSD", "FX_IDC:EURUSD", aEurUsd, tEurUsd, lastEurUsd)
+    lastUsdJpy := f_forward("USDJPY", "FX_IDC:USDJPY", aUsdJpy, tUsdJpy, lastUsdJpy)
+    lastEurJpy := f_forward("EURJPY", "FX_IDC:EURJPY", aEurJpy, tEurJpy, lastEurJpy)
 else
-    [aGold, tGold] = request.security_lower_tf("OANDA:XAUUSD", "5", f_confirmedM5(), ignore_invalid_symbol=true)
+    [aGold, tGold] = request.security_lower_tf("VANTAGE:XAUUSD", "5", f_confirmedM5(), ignore_invalid_symbol=true)
     [aNasdaq, tNasdaq] = request.security_lower_tf(nasdaqSymbol, "5", f_confirmedM5(), ignore_invalid_symbol=true)
-    [aBitcoin, tBitcoin] = request.security_lower_tf("BITSTAMP:BTCUSD", "5", f_confirmedM5(), ignore_invalid_symbol=true)
-    [aEurUsd, tEurUsd] = request.security_lower_tf("OANDA:EURUSD", "5", f_confirmedM5(), ignore_invalid_symbol=true)
-    [aUsdJpy, tUsdJpy] = request.security_lower_tf("OANDA:USDJPY", "5", f_confirmedM5(), ignore_invalid_symbol=true)
-    [aEurJpy, tEurJpy] = request.security_lower_tf("OANDA:EURJPY", "5", f_confirmedM5(), ignore_invalid_symbol=true)
-    lastGold := f_forwardArray("XAUUSD", "OANDA:XAUUSD", aGold, tGold, lastGold)
+    [aBitcoin, tBitcoin] = request.security_lower_tf("CRYPTO:BTCUSD", "5", f_confirmedM5(), ignore_invalid_symbol=true)
+    [aEurUsd, tEurUsd] = request.security_lower_tf("FX_IDC:EURUSD", "5", f_confirmedM5(), ignore_invalid_symbol=true)
+    [aUsdJpy, tUsdJpy] = request.security_lower_tf("FX_IDC:USDJPY", "5", f_confirmedM5(), ignore_invalid_symbol=true)
+    [aEurJpy, tEurJpy] = request.security_lower_tf("FX_IDC:EURJPY", "5", f_confirmedM5(), ignore_invalid_symbol=true)
+    lastGold := f_forwardArray("XAUUSD", "VANTAGE:XAUUSD", aGold, tGold, lastGold)
     lastNasdaq := f_forwardArray("NASDAQ", nasdaqSymbol, aNasdaq, tNasdaq, lastNasdaq)
-    lastBitcoin := f_forwardArray("BTCUSD", "BITSTAMP:BTCUSD", aBitcoin, tBitcoin, lastBitcoin)
-    lastEurUsd := f_forwardArray("EURUSD", "OANDA:EURUSD", aEurUsd, tEurUsd, lastEurUsd)
-    lastUsdJpy := f_forwardArray("USDJPY", "OANDA:USDJPY", aUsdJpy, tUsdJpy, lastUsdJpy)
-    lastEurJpy := f_forwardArray("EURJPY", "OANDA:EURJPY", aEurJpy, tEurJpy, lastEurJpy)
+    lastBitcoin := f_forwardArray("BTCUSD", "CRYPTO:BTCUSD", aBitcoin, tBitcoin, lastBitcoin)
+    lastEurUsd := f_forwardArray("EURUSD", "FX_IDC:EURUSD", aEurUsd, tEurUsd, lastEurUsd)
+    lastUsdJpy := f_forwardArray("USDJPY", "FX_IDC:USDJPY", aUsdJpy, tUsdJpy, lastUsdJpy)
+    lastEurJpy := f_forwardArray("EURJPY", "FX_IDC:EURJPY", aEurJpy, tEurJpy, lastEurJpy)
 
 // Purely VISUAL: chosen market's true ADX for the current chart timeframe.
 // Changing 1m -> 5m -> 15m -> 1h -> 4h -> D1 automatically recalculates
 // the plotted ADX with its own 14-bar window for that specific timeframe.
 string displaySymbol = switch displayed
-    "XAUUSD" => "OANDA:XAUUSD"
+    "XAUUSD" => "VANTAGE:XAUUSD"
     "NASDAQ" => nasdaqSymbol
-    "BTCUSD" => "BITSTAMP:BTCUSD"
-    "EURUSD" => "OANDA:EURUSD"
-    "USDJPY" => "OANDA:USDJPY"
-    "EURJPY" => "OANDA:EURJPY"
+    "BTCUSD" => "CRYPTO:BTCUSD"
+    "EURUSD" => "FX_IDC:EURUSD"
+    "USDJPY" => "FX_IDC:USDJPY"
+    "EURJPY" => "FX_IDC:EURJPY"
     => syminfo.tickerid
 
 float displayAdx = displayed == "Chart symbol" ? f_adx() : request.security(displaySymbol, timeframe.period, f_adx(), gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off, ignore_invalid_symbol=true)

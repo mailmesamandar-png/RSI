@@ -625,13 +625,23 @@ async def tradingview_webhook(secret: str, request: Request):
         else:
             fields = "-"
         version = payload.get("version") if isinstance(payload, dict) else None
+        # Only constant, explicitly approved error labels may reach logs:
+        # never log incoming payloads, source strings, secrets or webhook paths.
+        known_reasons = {
+            "source must include an exchange/broker prefix": "missing_source_prefix",
+            "NASDAQ must use the selected IG symbol": "nasdaq_feed_mismatch",
+            "source does not match selected ADX data provider": "feed_mismatch",
+            "bar_time is in the future": "future_bar_time",
+        }
+        reason = known_reasons.get(str(ex), "other") if isinstance(ex, ValueError) else "-"
         LOG.warning(
             "TradingView webhook rejected status=422 version=%s content_type=%s "
-            "error=%s fields=%s",
+            "error=%s fields=%s reason=%s",
             version if isinstance(version, int) else "unknown",
             request.headers.get("content-type", "missing").split(";")[0][:40],
             type(ex).__name__,
             fields,
+            reason,
         )
         raise HTTPException(status_code=422, detail=type(ex).__name__) from ex
 

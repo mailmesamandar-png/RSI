@@ -141,25 +141,30 @@ def initialize_db() -> None:
                 ON adx_audit(bar_time);
             """
         )
-        # Retire RSI/H1 models and pending deliveries; retain paired users,
-        # deletion/retention machinery, secret configuration and Telegram UI.
-        conn.execute(
-            "DELETE FROM outbox WHERE id LIKE 'rsi:%' OR id LIKE 'replay:%' "
-            "OR id LIKE 'h1double:%' OR id LIKE 'status:%' "
-            "OR id LIKE 'delete_replay:%'"
-        )
-        # Remove tracked old RSI alerts from Telegram on migration.
-        # Queue durable deletions before forgetting their Telegram message ids.
-        for row in conn.execute(
-            "SELECT chat_id,message_id FROM signal_messages"
-        ).fetchall():
-            enqueue(conn,
-                    f"delete_signal:{row['chat_id']}:{row['message_id']}",
-                    int(row["chat_id"]), str(row["message_id"]))
-        conn.execute("DELETE FROM signal_messages")
-        for table in ("latest", "pair_latest", "pair_audit", "rsi_signal_gate",
-                      "scan_jobs", "replay_messages", "h1_double_sweeps"):
-            conn.execute(f"DROP TABLE IF EXISTS {table}")
+        # One-time retirement of old model data. Never delete new ADX alerts
+        # after a service restart: their 24-hour lifecycle is handled by worker.
+        converted = conn.execute(
+            "SELECT 1 FROM settings WHERE key='adx_migrated_v3'"
+        ).fetchone()
+        if not converted:
+            conn.execute(
+                "DELETE FROM outbox WHERE id LIKE 'rsi:%' OR id LIKE 'replay:%' "
+                "OR id LIKE 'h1double:%' OR id LIKE 'status:%' "
+                "OR id LIKE 'delete_replay:%'"
+            )
+            for row in conn.execute(
+                "SELECT chat_id,message_id FROM signal_messages"
+            ).fetchall():
+                enqueue(conn,
+                        f"delete_signal:{row['chat_id']}:{row['message_id']}",
+                        int(row["chat_id"]), str(row["message_id"]))
+            conn.execute("DELETE FROM signal_messages")
+            for table in ("latest", "pair_latest", "pair_audit", "rsi_signal_gate",
+                          "scan_jobs", "replay_messages", "h1_double_sweeps"):
+                conn.execute(f"DROP TABLE IF EXISTS {table}")
+            conn.execute(
+                "INSERT INTO settings(key,value) VALUES('adx_migrated_v3','1')"
+            )
         # Keep previously paired users, including upgraded legacy accounts.
         old_owner = conn.execute(
             "SELECT value FROM settings WHERE key='paired_chat'"
@@ -429,8 +434,7 @@ async def delivery_worker() -> None:
                     )
                     is_status = task_id.startswith("status:")
                     is_live_signal = task_id.startswith("adx:")
-                    is_replay = False  # retired; reserved for safe migration
-                    is_signal = is_live_signal or is_replay
+                    is_signal = is_live_signal
                     try:
                         if is_delete:
                             response = await client.post(
@@ -447,11 +451,6 @@ async def delivery_worker() -> None:
                                 if not response.json().get("ok"):
                                     raise RuntimeError("Telegram deletion returned not-ok")
                             with closing(db_connect()) as conn:
-                                if task_id.startswith(("delete_replay:", "delete_signal:")):
-                                    conn.execute(
-                                        "DELETE FROM replay_messages WHERE chat_id=? AND message_id=?",
-                                        (row["chat_id"], int(row["body"])),
-                                    )
                                 conn.execute("DELETE FROM outbox WHERE id=?", (task_id,))
                                 conn.commit()
                             continue
@@ -460,7 +459,7 @@ async def delivery_worker() -> None:
                         if is_signal:
                             # Older queued events should never be delivered as
                             # fresh signals once their 24-hour window is over.
-                            event_time_ms = int(task_id.split(":")[2 if is_replay else 1])
+                            event_time_ms = int(task_id.split(":")[1])
                             if event_time_ms + SIGNAL_RETENTION_MS <= int(time.time() * 1000):
                                 with closing(db_connect()) as conn:
                                     if is_live_signal:
@@ -533,13 +532,6 @@ async def delivery_worker() -> None:
                                     (row["chat_id"], message_id, event_time_ms,
                                      event_time_ms + SIGNAL_RETENTION_MS),
                                 )
-                                if is_replay:
-                                    conn.execute(
-                                        """INSERT OR IGNORE INTO replay_messages(
-                                             chat_id,message_id,scan_id) VALUES(?,?,?)""",
-                                        (row["chat_id"], message_id,
-                                         int(task_id.split(":")[1])),
-                                    )
                             # Legacy 'reply:' messages, if any, are not
                             # deleted automatically because their purpose is unknown.
                             conn.execute("DELETE FROM outbox WHERE id=?", (task_id,))

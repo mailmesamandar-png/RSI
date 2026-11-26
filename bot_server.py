@@ -1,4 +1,4 @@
-"""FX RSI Monitor: TradingView snapshots -> Telegram signal alerts + /status.
+"""Six-market M5 ADX(14) signal bot: TradingView readings -> Telegram alerts.
 
 This service does NOT determine trade validity, entries, exits or cancellations.
 Run one application worker with persistent SQLite storage.
@@ -22,15 +22,15 @@ import httpx
 from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-LOG = logging.getLogger("fx_rsi_monitor")
+LOG = logging.getLogger("adx_signal_monitor")
 logging.basicConfig(level=logging.INFO)
 # The HTTP client logs the complete Telegram API URL at INFO level,
 # which would expose the bot token in hosting logs.
 logging.getLogger("httpx").setLevel(logging.WARNING)
-PAIRS = ("EURUSD", "USDJPY", "EURJPY")
+PAIRS = ("XAUUSD", "NASDAQ", "BTCUSD", "EURUSD", "USDJPY", "EURJPY")
 NEW_YORK_TZ = ZoneInfo("America/New_York")
-STATUS_BUTTON = "📊 Current Status"
-AUDIT_BUTTON = "📋 RSI Event Audit"
+STATUS_BUTTON = "📊 ADX Status"
+AUDIT_BUTTON = "📋 ADX Event Audit"
 SIGNAL_RETENTION_MS = 24 * 60 * 60 * 1000
 STATUS_KEYBOARD = {
     "keyboard": [[{"text": STATUS_BUTTON}], [{"text": AUDIT_BUTTON}]],
@@ -41,57 +41,25 @@ STATUS_KEYBOARD = {
 
 
 
-class Signal(BaseModel):
+class ADXReading(BaseModel):
+    """One last-completed M5 ADX(14) reading for a specific instrument."""
     model_config = ConfigDict(extra="forbid")
-    ticker: Literal["EURUSD", "USDJPY", "EURJPY"]
-    level: Literal[30, 70]
-
-
-class PairSnapshot(BaseModel):
-    """A chart-native, per-symbol TradingView alert including reset audit."""
-    model_config = ConfigDict(extra="forbid")
-    version: Literal[2]
-    ticker: Literal["EURUSD", "USDJPY", "EURJPY"]
-    source: str = Field(min_length=5, max_length=80)
-    event_time: int = Field(gt=1_500_000_000_000)
-    state: Literal["BUY", "SELL", "RANGE"]
-    rsi: float = Field(ge=0, le=100)
-    reset50: bool
-    signal_level: Literal[0, 30, 70]
+    version: Literal[3]
+    ticker: Literal["XAUUSD", "NASDAQ", "BTCUSD", "EURUSD", "USDJPY", "EURJPY"]
+    source: str = Field(min_length=5, max_length=90)
+    bar_time: int = Field(gt=1_500_000_000_000)
+    timeframe: Literal["5"]
+    period: Literal[14]
+    adx: float = Field(ge=0, le=100)
 
     def check_logic(self) -> None:
-        if self.source != f"OANDA:{self.ticker}":
-            raise ValueError(
-                f"Use OANDA:{self.ticker} as the chart symbol for matching RSI data"
-            )
-        if self.signal_level == 70 and self.state != "BUY":
-            raise ValueError("70 signal must produce BUY state")
-        if self.signal_level == 30 and self.state != "SELL":
-            raise ValueError("30 signal must produce SELL state")
-        if self.reset50 and not self.signal_level and self.state != "RANGE":
-            raise ValueError("RSI 50 reset must produce RANGE state")
-        if self.event_time > int(time.time() * 1000) + 2 * 60 * 1000:
-            raise ValueError("event_time is in the future")
-
-
-class Snapshot(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    version: Literal[1]
-    bar_time: int = Field(gt=1_500_000_000_000)  # Unix epoch milliseconds
-    states: dict[str, Literal["BUY", "SELL", "RANGE"]]
-    signals: list[Signal] = Field(max_length=3)
-
-    def check_logic(self) -> None:
-        if set(self.states) != set(PAIRS):
-            raise ValueError("Exactly EURUSD, USDJPY and EURJPY states are required")
-        if len({s.ticker for s in self.signals}) != len(self.signals):
-            raise ValueError("Only one event per ticker per completed M5 bar")
-        for s in self.signals:
-            expected = "BUY" if s.level == 70 else "SELL"
-            if self.states[s.ticker] != expected:
-                raise ValueError(f"{s.ticker} signal/state mismatch")
-        if self.bar_time > int(time.time() * 1000) + 15 * 60 * 1000:
-            raise ValueError("bar_time is too far in the future")
+        # Different NASDAQ-family contracts share one NASDAQ signal gate.
+        if ":" not in self.source:
+            raise ValueError("source must include an exchange/broker prefix")
+        if self.ticker != "NASDAQ" and self.source.split(":")[-1] != self.ticker:
+            raise ValueError("source instrument does not match ticker")
+        if self.bar_time > int(time.time() * 1000) + 2 * 60 * 1000:
+            raise ValueError("bar_time is in the future")
 
 
 def env_required(name: str, min_len: int) -> str:
@@ -135,38 +103,6 @@ def initialize_db() -> None:
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
             );
-            CREATE TABLE IF NOT EXISTS latest (
-                id INTEGER PRIMARY KEY CHECK(id = 1),
-                bar_time INTEGER NOT NULL,
-                states_json TEXT NOT NULL,
-                received_at INTEGER NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS pair_latest (
-                ticker TEXT PRIMARY KEY,
-                event_time INTEGER NOT NULL,
-                state TEXT NOT NULL,
-                rsi REAL NOT NULL,
-                source TEXT NOT NULL,
-                received_at INTEGER NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS pair_audit (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                ticker TEXT NOT NULL,
-                event_time INTEGER NOT NULL,
-                kind TEXT NOT NULL,
-                rsi REAL NOT NULL,
-                state TEXT NOT NULL,
-                source TEXT NOT NULL,
-                task_id TEXT UNIQUE,
-                delivery_status TEXT NOT NULL DEFAULT 'not_applicable',
-                telegram_message_id INTEGER
-            );
-            CREATE INDEX IF NOT EXISTS pair_audit_time_idx ON pair_audit(event_time);
-            CREATE TABLE IF NOT EXISTS rsi_signal_gate (
-                ticker TEXT PRIMARY KEY,
-                last_signal_ms INTEGER NOT NULL DEFAULT 0,
-                last_reset_ms INTEGER NOT NULL DEFAULT 0
-            );
             CREATE TABLE IF NOT EXISTS outbox (
                 id TEXT PRIMARY KEY,
                 chat_id INTEGER NOT NULL,
@@ -183,50 +119,48 @@ def initialize_db() -> None:
             );
             CREATE INDEX IF NOT EXISTS signal_expiry_idx
                 ON signal_messages(expires_at_ms);
-            CREATE TABLE IF NOT EXISTS scan_jobs (
+            CREATE TABLE IF NOT EXISTS adx_latest (
+                ticker TEXT PRIMARY KEY,
+                bar_time INTEGER NOT NULL,
+                adx REAL NOT NULL,
+                source TEXT NOT NULL,
+                armed INTEGER NOT NULL,
+                received_at INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS adx_audit (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                telegram_update_id INTEGER UNIQUE NOT NULL,
-                chat_id INTEGER NOT NULL,
-                requested_at INTEGER NOT NULL,
-                state TEXT NOT NULL DEFAULT 'queued'
+                ticker TEXT NOT NULL,
+                bar_time INTEGER NOT NULL,
+                adx REAL NOT NULL,
+                source TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                task_id TEXT UNIQUE,
+                delivery_status TEXT NOT NULL DEFAULT 'not_applicable'
             );
-            CREATE INDEX IF NOT EXISTS scan_jobs_state
-                ON scan_jobs(state,id);
-            CREATE TABLE IF NOT EXISTS replay_messages (
-                chat_id INTEGER NOT NULL,
-                message_id INTEGER NOT NULL,
-                scan_id INTEGER NOT NULL,
-                PRIMARY KEY(chat_id,message_id)
-            );
+            CREATE INDEX IF NOT EXISTS adx_audit_time_idx
+                ON adx_audit(bar_time);
             """
         )
-        # Purge retired non-RSI alerts, queued mixed audits and stored setup data.
-        conn.execute("DELETE FROM outbox WHERE id LIKE 'h1double:%'")
+        # Retire RSI/H1 models and pending deliveries; retain paired users,
+        # deletion/retention machinery, secret configuration and Telegram UI.
         conn.execute(
-            "DELETE FROM outbox WHERE id LIKE 'status:%' AND "
-            "(body LIKE '%H1 DOUBLE SWEEP%' OR body LIKE '%H1 DOUBLE-SWEEP%')"
+            "DELETE FROM outbox WHERE id LIKE 'rsi:%' OR id LIKE 'replay:%' "
+            "OR id LIKE 'h1double:%' OR id LIKE 'status:%' "
+            "OR id LIKE 'delete_replay:%'"
         )
-        conn.execute("DROP TABLE IF EXISTS h1_double_sweeps")
-        # Seed persistent RSI 50-reset gates from existing audit history.
-        # A new or unknown symbol is disarmed until an explicit reset50 event.
-        for ticker in PAIRS:
-            last_signal = conn.execute(
-                "SELECT MAX(event_time) FROM pair_audit "
-                "WHERE ticker=? AND kind IN ('RSI30','RSI70') "
-                "AND delivery_status!='suppressed_no_50_reset'",
-                (ticker,),
-            ).fetchone()[0] or 0
-            last_reset = conn.execute(
-                "SELECT MAX(event_time) FROM pair_audit "
-                "WHERE ticker=? AND kind='RESET50'",
-                (ticker,),
-            ).fetchone()[0] or 0
-            conn.execute(
-                "INSERT OR IGNORE INTO rsi_signal_gate "
-                "(ticker,last_signal_ms,last_reset_ms) VALUES(?,?,?)",
-                (ticker, last_signal, last_reset),
-            )
-        # Preserve the previously paired user during the upgrade.
+        # Remove tracked old RSI alerts from Telegram on migration.
+        # Queue durable deletions before forgetting their Telegram message ids.
+        for row in conn.execute(
+            "SELECT chat_id,message_id FROM signal_messages"
+        ).fetchall():
+            enqueue(conn,
+                    f"delete_signal:{row['chat_id']}:{row['message_id']}",
+                    int(row["chat_id"]), str(row["message_id"]))
+        conn.execute("DELETE FROM signal_messages")
+        for table in ("latest", "pair_latest", "pair_audit", "rsi_signal_gate",
+                      "scan_jobs", "replay_messages", "h1_double_sweeps"):
+            conn.execute(f"DROP TABLE IF EXISTS {table}")
+        # Keep previously paired users, including upgraded legacy accounts.
         old_owner = conn.execute(
             "SELECT value FROM settings WHERE key='paired_chat'"
         ).fetchone()
@@ -268,232 +202,126 @@ def format_signal_time(bar_time_ms: int) -> str:
     return closed_utc.astimezone(NEW_YORK_TZ).strftime("%Y-%m-%d %H:%M %Z")
 
 
-def accept_snapshot(snapshot: Snapshot) -> bool:
-    """Atomic update; out-of-order/duplicate candle snapshots cannot duplicate alerts."""
-    snapshot.check_logic()
-    with closing(db_connect()) as conn:
-        conn.execute("BEGIN IMMEDIATE")
-        last = conn.execute("SELECT bar_time FROM latest WHERE id = 1").fetchone()
-        if last and snapshot.bar_time <= last["bar_time"]:
-            conn.rollback()
-            return False
-        conn.execute(
-            """INSERT INTO latest(id,bar_time,states_json,received_at)
-               VALUES(1,?,?,?)
-               ON CONFLICT(id) DO UPDATE SET
-               bar_time=excluded.bar_time,
-               states_json=excluded.states_json,
-               received_at=excluded.received_at""",
-            (snapshot.bar_time, json.dumps(snapshot.states), int(time.time())),
-        )
-        recipients = authorized_chats(conn)
-        if recipients:
-            for s in snapshot.signals:
-                # Once native V2 pair monitor has reported for a pair,
-                # suppress legacy V1 alerts for that pair to avoid duplicates.
-                native = conn.execute(
-                    "SELECT 1 FROM pair_latest WHERE ticker=?", (s.ticker,)
-                ).fetchone()
-                if native:
-                    continue
-                # Signal event time is the confirmed M5 close, not the
-                # phone's local Telegram UI time or delayed send time.
-                ny_time = format_signal_time(snapshot.bar_time)
-                for chat_id in recipients:
-                    enqueue(conn, f"rsi:{snapshot.bar_time}:{s.ticker}:{s.level}:{chat_id}",
-                            chat_id, f"{s.ticker} — RSI {s.level}\nNY: {ny_time}")
-        conn.commit()
-    if snapshot.signals:
-        # Record emitted candidates without chat IDs, tokens or price data.
-        # Useful when auditing visually observed vs actual qualified crossings.
-        LOG.info("M5 signal candidates NY=%s events=%s recipient_paired=%s",
-                 format_signal_time(snapshot.bar_time),
-                 ",".join(f"{s.ticker}:{s.level}" for s in snapshot.signals),
-                 bool(recipients))
-    return True
+def accept_adx_reading(item: ADXReading) -> bool:
+    """Detect *rising* M5 ADX crossing 30; only readings below 30 rearm.
 
-
-def accept_pair_tick(item: PairSnapshot) -> bool:
-    """Store exact per-chart RSI touches, resets and M5 heartbeats.
-
-    The per-ticker timestamp is monotonic. A duplicate webhook cannot
-    schedule a second Telegram alert. Events are durably auditable.
+    No alert is generated on a downward crossing. Crossings are derived from
+    consecutive confirmed readings, not trusted event flags from TradingView.
+    All state changes and notification queues are committed atomically.
     """
     item.check_logic()
     with closing(db_connect()) as conn:
         conn.execute("BEGIN IMMEDIATE")
-        last = conn.execute(
-            "SELECT event_time,rsi FROM pair_latest WHERE ticker=?",
+        prior = conn.execute(
+            "SELECT bar_time,adx,armed FROM adx_latest WHERE ticker=?",
             (item.ticker,),
         ).fetchone()
-        if last and item.event_time <= last["event_time"]:
+        if prior and item.bar_time <= prior["bar_time"]:
             conn.rollback()
             return False
 
-        received_at = int(time.time())
-        conn.execute(
-            """INSERT INTO pair_latest(ticker,event_time,state,rsi,source,received_at)
-               VALUES(?,?,?,?,?,?)
-               ON CONFLICT(ticker) DO UPDATE SET
-                   event_time=excluded.event_time,state=excluded.state,
-                   rsi=excluded.rsi,source=excluded.source,
-                   received_at=excluded.received_at""",
-            (item.ticker, item.event_time, item.state, item.rsi,
-             item.source, received_at),
-        )
-        kind = ("RSI70" if item.signal_level == 70 else
-                "RSI30" if item.signal_level == 30 else
-                "RESET50" if item.reset50 else "HEARTBEAT")
-        task_id = None
+        armed = (int(prior["armed"]) if prior else int(item.adx < 30))
+        kind = "INITIAL" if prior is None else "HEARTBEAT"
         delivery = "not_applicable"
-        recipients = authorized_chats(conn)
-        gate = conn.execute(
-            "SELECT last_signal_ms,last_reset_ms FROM rsi_signal_gate WHERE ticker=?",
-            (item.ticker,),
-        ).fetchone()
-        # Rearm only when RSI genuinely returns through the 50 midline.
-        # The Pine reset50 flag provides intrabar crossings; consecutive RSI
-        # readings provide an independent fallback for missing reset50 events.
-        inferred_reset = False
-        if not item.signal_level and not item.reset50 and gate and last:
-            previous_rsi = float(last["rsi"])
-            latest_rsi = float(item.rsi)
-            if gate["last_signal_ms"] > 0:
-                previous_signal = conn.execute(
-                    "SELECT kind FROM pair_audit "
-                    "WHERE ticker=? AND event_time=? "
-                    "AND kind IN ('RSI30','RSI70') "
-                    "AND delivery_status!='suppressed_no_50_reset' "
-                    "ORDER BY id DESC LIMIT 1",
-                    (item.ticker, gate["last_signal_ms"]),
-                ).fetchone()
-                if previous_signal:
-                    if previous_signal["kind"] == "RSI70":
-                        inferred_reset = previous_rsi > 50 >= latest_rsi
-                    else:
-                        inferred_reset = previous_rsi < 50 <= latest_rsi
-            elif gate["last_reset_ms"] == 0:
-                inferred_reset = (
-                    (previous_rsi > 50 >= latest_rsi)
-                    or (previous_rsi < 50 <= latest_rsi)
-                )
-        if (item.reset50 or inferred_reset) and not item.signal_level:
-            conn.execute(
-                "UPDATE rsi_signal_gate SET last_reset_ms=? WHERE ticker=?",
-                (item.event_time, item.ticker),
-            )
-        if inferred_reset:
-            conn.execute(
-                "INSERT INTO pair_audit "
-                "(ticker,event_time,kind,rsi,state,source,delivery_status) "
-                "VALUES(?,?,?,?,?,?,'not_applicable')",
-                (item.ticker, item.event_time, "RESET50", item.rsi,
-                 item.state, item.source),
-            )
-        if item.signal_level:
-            armed = bool(gate and gate["last_reset_ms"] > gate["last_signal_ms"])
-            if armed:
-                conn.execute(
-                    "UPDATE rsi_signal_gate SET last_signal_ms=? WHERE ticker=?",
-                    (item.event_time, item.ticker),
-                )
+        task_id = None
+        if prior:
+            previous = float(prior["adx"])
+            if item.adx < 30:
+                if not armed:
+                    kind = "RESET"
+                armed = 1
+            elif previous < 30 <= item.adx and armed:
+                kind = "CROSS30"
+                armed = 0
+                task_id = f"adx:{item.bar_time}:{item.ticker}"
+                recipients = authorized_chats(conn)
                 if recipients:
-                    task_id = (f"rsi:{item.event_time}:{item.ticker}:"
-                               f"{item.signal_level}")
-                    body = (f"{item.ticker} — RSI {item.signal_level}\n"
-                            f"NY: {format_signal_time(item.event_time)}")
+                    name = (f"NASDAQ ({item.source})" if item.ticker == "NASDAQ"
+                            else item.ticker)
+                    body = (f"{name} — ADX 30\n"
+                            f"NY: {format_signal_time(item.bar_time)}")
                     for chat_id in recipients:
                         enqueue(conn, f"{task_id}:{chat_id}", chat_id, body)
                     delivery = "queued"
                 else:
                     delivery = "no_paired_chat"
             else:
-                delivery = "suppressed_no_50_reset"
+                # Above 30 without a new crossing cannot generate an alert.
+                armed = 0
+
         conn.execute(
-            """INSERT INTO pair_audit(
-                   ticker,event_time,kind,rsi,state,source,task_id,delivery_status)
-               VALUES(?,?,?,?,?,?,?,?)""",
-            (item.ticker, item.event_time, kind, item.rsi, item.state,
-             item.source, task_id, delivery),
+            """INSERT INTO adx_latest(ticker,bar_time,adx,source,armed,received_at)
+               VALUES(?,?,?,?,?,?)
+               ON CONFLICT(ticker) DO UPDATE SET
+                   bar_time=excluded.bar_time,adx=excluded.adx,
+                   source=excluded.source,armed=excluded.armed,
+                   received_at=excluded.received_at""",
+            (item.ticker, item.bar_time, item.adx, item.source,
+             armed, int(time.time())),
         )
-        if item.reset50 and item.signal_level:
+        if kind in ("CROSS30", "RESET"):
             conn.execute(
-                """INSERT INTO pair_audit(
-                       ticker,event_time,kind,rsi,state,source,delivery_status)
-                   VALUES(?,?,?,?,?,?,'not_applicable')""",
-                (item.ticker, item.event_time, "RESET50", item.rsi,
-                 item.state, item.source),
+                """INSERT INTO adx_audit
+                   (ticker,bar_time,adx,source,kind,task_id,delivery_status)
+                   VALUES(?,?,?,?,?,?,?)""",
+                (item.ticker, item.bar_time, item.adx, item.source,
+                 kind, task_id, delivery),
             )
         conn.execute(
-            "DELETE FROM pair_audit WHERE event_time < ?",
-            (item.event_time - 7 * 24 * 60 * 60 * 1000,),
+            "DELETE FROM adx_audit WHERE bar_time < ?",
+            (item.bar_time - 7 * 24 * 60 * 60 * 1000,),
         )
         conn.commit()
-
-    if inferred_reset:
-        LOG.info("RSI 50 reset inferred from readings ticker=%s NY=%s",
-                 item.ticker, format_signal_time(item.event_time))
-    if kind != "HEARTBEAT" or item.reset50:
-        LOG.info(
-            "RSI pair event=%s ticker=%s NY=%s rsi=%.3f delivery=%s",
-            kind, item.ticker, format_signal_time(item.event_time),
-            item.rsi, delivery,
-        )
+    if kind in ("CROSS30", "RESET"):
+        LOG.info("ADX M5 event=%s ticker=%s NY=%s value=%.3f delivery=%s",
+                 kind, item.ticker, format_signal_time(item.bar_time),
+                 item.adx, delivery)
     return True
 
 
 def signal_audit() -> str:
-    """One line per RSI 30/70 signal recorded in the last 24 hours."""
+    """Exactly the last 24 hours of valid ADX upward-crossing signals."""
     cutoff_ms = int(time.time() * 1000) - SIGNAL_RETENTION_MS
     with closing(db_connect()) as conn:
         rows = conn.execute(
-            """SELECT ticker, event_time, kind
-               FROM pair_audit
-               WHERE kind IN ('RSI30', 'RSI70') AND event_time >= ?
-                 AND delivery_status != 'suppressed_no_50_reset'
-               ORDER BY event_time DESC, id DESC""",
+            """SELECT ticker,bar_time,adx,source FROM adx_audit
+               WHERE kind='CROSS30' AND bar_time >= ?
+               ORDER BY bar_time DESC,id DESC""",
             (cutoff_ms,),
         ).fetchall()
-
     if not rows:
-        return "No RSI 30/70 crossings recorded in the last 24 hours."
-
+        return "No ADX(14) crossings above 30 in the last 24 hours."
     return "\n".join(
-        f"{row['ticker']} | {row['kind'][3:]} | "
-        f"{datetime.fromtimestamp(row['event_time'] / 1000, NEW_YORK_TZ).strftime('%m-%d %H:%M:%S %Z')}"
+        (f"{'NASDAQ (' + row['source'] + ')' if row['ticker'] == 'NASDAQ' else row['ticker']}"
+         f" | ADX 30 | "
+         f"{datetime.fromtimestamp(row['bar_time'] / 1000, NEW_YORK_TZ).strftime('%m-%d %H:%M:%S %Z')}")
         for row in rows
     )
 
 
 def current_status() -> str:
-    """Use native per-pair monitor states when available; show stale feeds."""
+    """Current last-completed M5 ADX value for every configured market."""
     assert config is not None
     with closing(db_connect()) as conn:
-        old = conn.execute(
-            "SELECT bar_time,states_json FROM latest WHERE id=1"
-        ).fetchone()
-        native = {
+        rows = {
             row["ticker"]: row
             for row in conn.execute(
-                "SELECT ticker,event_time,state,rsi,received_at FROM pair_latest"
+                "SELECT ticker,bar_time,adx,source,armed FROM adx_latest"
             ).fetchall()
         }
-    old_states = json.loads(old["states_json"]) if old else {}
-    lines = []
     now_ms = int(time.time() * 1000)
+    lines = ["ADX(14) M5 — latest confirmed readings"]
     stale = []
     for ticker in PAIRS:
-        row = native.get(ticker)
-        if row:
-            lines.append(f"{ticker} — {row['state']} (RSI {row['rsi']:.2f})")
-            if now_ms - row["event_time"] > config.stale_after_minutes * 60_000:
-                stale.append(ticker)
-        elif ticker in old_states:
-            lines.append(f"{ticker} — {old_states[ticker]} (legacy monitor)")
-            if now_ms - old["bar_time"] > config.stale_after_minutes * 60_000:
-                stale.append(ticker)
-        else:
+        row = rows.get(ticker)
+        if row is None:
             lines.append(f"{ticker} — WAITING FOR FIRST UPDATE")
+            continue
+        name = f"NASDAQ ({row['source']})" if ticker == "NASDAQ" else ticker
+        level = "BELOW 30" if row["adx"] < 30 else "AT/ABOVE 30"
+        lines.append(f"{name} — {row['adx']:.2f} ({level})")
+        if now_ms - row["bar_time"] > config.stale_after_minutes * 60_000:
+            stale.append(ticker)
     if stale:
         lines.append("⚠️ STALE MONITOR: " + ", ".join(stale))
     return "\n".join(lines)
@@ -544,10 +372,10 @@ def handle_telegram_update(data: dict) -> None:
         elif not authorized:
             body = ("This Telegram chat is not paired. Send your private "
                     "pairing command: /start YOUR_PRIVATE_CODE")
-        elif command == "/audit" or text.strip() == AUDIT_BUTTON:
+        elif command == "/audit" or text.strip() in (AUDIT_BUTTON, "📋 RSI Event Audit"):
             body = signal_audit()
         elif command == "/scan" or text.strip() == "🔎 Scan Last 24h":
-            body = "Historical scan has been retired. Live RSI alerts and event audit remain active."
+            body = "Historical scan is unavailable. ADX signals and the 24-hour audit remain active."
         else:
             # The Current Status button and /status preserve existing behavior.
             body = current_status()
@@ -600,8 +428,8 @@ async def delivery_worker() -> None:
                         ("delete:", "delete_signal:", "delete_request:", "delete_replay:")
                     )
                     is_status = task_id.startswith("status:")
-                    is_live_signal = task_id.startswith("rsi:")
-                    is_replay = task_id.startswith("replay:")
+                    is_live_signal = task_id.startswith("adx:")
+                    is_replay = False  # retired; reserved for safe migration
                     is_signal = is_live_signal or is_replay
                     try:
                         if is_delete:
@@ -638,7 +466,7 @@ async def delivery_worker() -> None:
                                     if is_live_signal:
                                         base_task = task_id.rsplit(":", 1)[0]
                                         conn.execute(
-                                            "UPDATE pair_audit SET delivery_status='expired' "
+                                            "UPDATE adx_audit SET delivery_status='expired' "
                                             "WHERE task_id=? AND delivery_status='queued'",
                                             (base_task,),
                                         )
@@ -695,7 +523,7 @@ async def delivery_worker() -> None:
                                     ).fetchone()[0]
                                     if remaining == 0:
                                         conn.execute(
-                                            "UPDATE pair_audit SET delivery_status='sent' WHERE task_id=?",
+                                            "UPDATE adx_audit SET delivery_status='sent' WHERE task_id=?",
                                             (base_task,),
                                         )
                                 conn.execute(
@@ -742,12 +570,6 @@ async def lifespan(app: FastAPI):
     global config
     config = Config()
     initialize_db()
-    # Retire any historical scans still queued/running; do not affect live RSI alerts.
-    with closing(db_connect()) as conn:
-        conn.execute("UPDATE scan_jobs SET state='cancelled' "
-                     "WHERE state IN ('queued','running')")
-        conn.execute("DELETE FROM outbox WHERE id LIKE 'replay:%'")
-        conn.commit()
     worker = asyncio.create_task(delivery_worker())
     try:
         yield
@@ -759,7 +581,7 @@ async def lifespan(app: FastAPI):
             pass
 
 
-app = FastAPI(title="FX RSI Monitor", docs_url=None, redoc_url=None, lifespan=lifespan)
+app = FastAPI(title="Six-Market ADX Signaller", docs_url=None, redoc_url=None, lifespan=lifespan)
 
 
 @app.get("/health")
@@ -779,13 +601,12 @@ async def tradingview_webhook(secret: str, request: Request):
         payload = await request.json()
         if not isinstance(payload, dict):
             raise ValueError("Expected JSON object")
-        if payload.get("version") == 2:
-            tick = PairSnapshot.model_validate(payload)
-            accepted = accept_pair_tick(tick)
-            return {"ok": True, "new_event": accepted}
-        snapshot = Snapshot.model_validate(payload)
-        updated = accept_snapshot(snapshot)
-        return {"ok": True, "new_candle": updated}
+        # Only ADX(14) v3 readings are accepted; RSI v1/v2 is disabled.
+        reading = ADXReading.model_validate(payload)
+        accepted = accept_adx_reading(reading)
+        return {"ok": True, "new_reading": accepted}
+
+
     except Exception as ex:
         # Safe diagnostics: NEVER log payload/body, URL (contains webhook
         # secret), token, user data, or values of fields. Report error classes

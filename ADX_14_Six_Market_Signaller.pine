@@ -1,81 +1,110 @@
 //@version=6
 indicator("ADX 14 | Six-Market Telegram Signaller", shorttitle="ADX30 Six Markets", overlay=false, dynamic_requests=true)
 
-// All readings use the last COMPLETED 5-minute candle.
-// Keep this indicator on a 1-minute chart so a new M5 close is forwarded promptly.
-// Only ONE TradingView alert is required: "Any alert() function call".
+// DISPLAY: Native ADX(14) for the currently selected chart timeframe.
+// SIGNALS: Exclusively last-confirmed 5-minute ADX(14) for six markets.
+// Backend sends one alert on rising ADX 30 crossing, rearms below 30.
+// This script never sends a direction or a falling-cross alert.
 
 string nasdaqSymbol = input.string("OANDA:NAS100USD", "NASDAQ family member", options=["OANDA:NAS100USD", "FOREXCOM:NAS100", "CAPITALCOM:US100", "CME_MINI:NQ1!", "CME_MINI:MNQ1!", "PEPPERSTONE:NAS100"], group="NASDAQ Family")
-string displayed = input.string("NASDAQ", "Display ADX for", options=["XAUUSD", "NASDAQ", "BTCUSD", "EURUSD", "USDJPY", "EURJPY"], group="Chart")
-
+string displayed = input.string("Chart symbol", "Display ADX for", options=["Chart symbol", "XAUUSD", "NASDAQ", "BTCUSD", "EURUSD", "USDJPY", "EURJPY"], group="Chart")
 const int adxLength = 14
-const float threshold = 30.0
+const float level = 30.0
 
-f_lastConfirmedADX() =>
+f_adx() =>
+    [diPlus, diMinus, adxValue] = ta.dmi(adxLength, adxLength)
+    adxValue
+
+f_confirmedM5() =>
     [diPlus, diMinus, adxValue] = ta.dmi(adxLength, adxLength)
     [adxValue[1], time_close[1]]
 
-[adxGold, tmGold] = request.security("OANDA:XAUUSD", "5", f_lastConfirmedADX(), gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_on, ignore_invalid_symbol=true)
-[adxNasdaq, tmNasdaq] = request.security(nasdaqSymbol, "5", f_lastConfirmedADX(), gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_on, ignore_invalid_symbol=true)
-[adxBitcoin, tmBitcoin] = request.security("BITSTAMP:BTCUSD", "5", f_lastConfirmedADX(), gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_on, ignore_invalid_symbol=true)
-[adxEurUsd, tmEurUsd] = request.security("OANDA:EURUSD", "5", f_lastConfirmedADX(), gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_on, ignore_invalid_symbol=true)
-[adxUsdJpy, tmUsdJpy] = request.security("OANDA:USDJPY", "5", f_lastConfirmedADX(), gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_on, ignore_invalid_symbol=true)
-[adxEurJpy, tmEurJpy] = request.security("OANDA:EURJPY", "5", f_lastConfirmedADX(), gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_on, ignore_invalid_symbol=true)
-
-if not (timeframe.isminutes and timeframe.multiplier == 1)
-    runtime.error("Run on a 1-minute chart. All six ADX calculations use completed M5 bars.")
-
-f_push(string ticker, string symbol, float adxValue, int barCloseMs) =>
-    string payload = '{"version":3,"ticker":"' + ticker + '","source":"' + symbol + '","bar_time":' + str.tostring(barCloseMs) + ',"timeframe":"5","period":14,"adx":' + str.tostring(adxValue, "#.####") + '}'
+// An alert is only a 5-minute price-series observation, not a trade call.
+// The Railway backend independently checks consecutive readings and enforces
+// one alert per upward crossing, with a silent reset below 30.
+f_push(string ticker, string source, float value, int closeMs) =>
+    string payload = '{"version":3,"ticker":"' + ticker + '","source":"' + source + '","bar_time":' + str.tostring(closeMs) + ',"timeframe":"5","period":14,"adx":' + str.tostring(value, "#.####") + '}'
     alert(payload, alert.freq_all)
 
-// The backend, not Pine, determines rising crosses through 30 and the reset
-// below 30. This prevents opposing-direction alerts and persists state across
-// changes to the TradingView indicator's runtime.
-var int lastGold = na
-var int lastNasdaq = na
-var int lastBitcoin = na
-var int lastEurUsd = na
-var int lastUsdJpy = na
-var int lastEurJpy = na
+// A persistent intrabar timestamp gate prevents repeated alerts on realtime
+// ticks of the same chart candle. The backend additionally deduplicates.
+f_forward(string ticker, string source, float value, int closeMs, int lastMs) =>
+    int nextMs = lastMs
+    if not na(value) and not na(closeMs) and (na(nextMs) or closeMs > nextMs)
+        // Avoid replaying older M5 observations on the first realtime tick
+        // when an already-open higher-timeframe chart is loaded.
+        if barstate.isrealtime and closeMs <= timenow and closeMs >= timenow - 600000
+            f_push(ticker, source, value, closeMs)
+        nextMs := closeMs
+    nextMs
 
-if not na(tmGold) and not na(adxGold) and (na(lastGold) or tmGold != lastGold)
-    if barstate.isrealtime and barstate.isconfirmed
-        f_push("XAUUSD", "OANDA:XAUUSD", adxGold, tmGold)
-    lastGold := tmGold
+f_forwardArray(string ticker, string source, array<float> values, array<int> times, int lastMs) =>
+    int nextMs = lastMs
+    int n = array.size(times)
+    if n > 0
+        if barstate.isrealtime
+            // All intrabars are chronological; scan the recent 30 minutes
+            // on every tick instead of repeatedly traversing whole weeks.
+            int first = math.max(0, n - 6)
+            for i = first to n - 1
+                nextMs := f_forward(ticker, source, array.get(values, i), array.get(times, i), nextMs)
+        else
+            nextMs := array.get(times, n - 1)
+    nextMs
 
-if not na(tmNasdaq) and not na(adxNasdaq) and (na(lastNasdaq) or tmNasdaq != lastNasdaq)
-    if barstate.isrealtime and barstate.isconfirmed
-        f_push("NASDAQ", nasdaqSymbol, adxNasdaq, tmNasdaq)
-    lastNasdaq := tmNasdaq
+varip int lastGold = na
+varip int lastNasdaq = na
+varip int lastBitcoin = na
+varip int lastEurUsd = na
+varip int lastUsdJpy = na
+varip int lastEurJpy = na
 
-if not na(tmBitcoin) and not na(adxBitcoin) and (na(lastBitcoin) or tmBitcoin != lastBitcoin)
-    if barstate.isrealtime and barstate.isconfirmed
-        f_push("BTCUSD", "BITSTAMP:BTCUSD", adxBitcoin, tmBitcoin)
-    lastBitcoin := tmBitcoin
+// On charts M5 or lower, a non-repainting request reads the PREVIOUS,
+// completed M5 bar, available from the first realtime tick of the next M5.
+// Above M5, security_lower_tf() captures the full ordered intrabar sequence,
+// rather than losing intermediate M5 events on M15/H1/H4/D1 charts.
+bool smallChart = timeframe.in_seconds(timeframe.period) <= 300
 
-if not na(tmEurUsd) and not na(adxEurUsd) and (na(lastEurUsd) or tmEurUsd != lastEurUsd)
-    if barstate.isrealtime and barstate.isconfirmed
-        f_push("EURUSD", "OANDA:EURUSD", adxEurUsd, tmEurUsd)
-    lastEurUsd := tmEurUsd
+if smallChart
+    [aGold, tGold] = request.security("OANDA:XAUUSD", "5", f_confirmedM5(), gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_on, ignore_invalid_symbol=true)
+    [aNasdaq, tNasdaq] = request.security(nasdaqSymbol, "5", f_confirmedM5(), gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_on, ignore_invalid_symbol=true)
+    [aBitcoin, tBitcoin] = request.security("BITSTAMP:BTCUSD", "5", f_confirmedM5(), gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_on, ignore_invalid_symbol=true)
+    [aEurUsd, tEurUsd] = request.security("OANDA:EURUSD", "5", f_confirmedM5(), gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_on, ignore_invalid_symbol=true)
+    [aUsdJpy, tUsdJpy] = request.security("OANDA:USDJPY", "5", f_confirmedM5(), gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_on, ignore_invalid_symbol=true)
+    [aEurJpy, tEurJpy] = request.security("OANDA:EURJPY", "5", f_confirmedM5(), gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_on, ignore_invalid_symbol=true)
+    lastGold := f_forward("XAUUSD", "OANDA:XAUUSD", aGold, tGold, lastGold)
+    lastNasdaq := f_forward("NASDAQ", nasdaqSymbol, aNasdaq, tNasdaq, lastNasdaq)
+    lastBitcoin := f_forward("BTCUSD", "BITSTAMP:BTCUSD", aBitcoin, tBitcoin, lastBitcoin)
+    lastEurUsd := f_forward("EURUSD", "OANDA:EURUSD", aEurUsd, tEurUsd, lastEurUsd)
+    lastUsdJpy := f_forward("USDJPY", "OANDA:USDJPY", aUsdJpy, tUsdJpy, lastUsdJpy)
+    lastEurJpy := f_forward("EURJPY", "OANDA:EURJPY", aEurJpy, tEurJpy, lastEurJpy)
+else
+    [aGold, tGold] = request.security_lower_tf("OANDA:XAUUSD", "5", f_confirmedM5(), ignore_invalid_symbol=true)
+    [aNasdaq, tNasdaq] = request.security_lower_tf(nasdaqSymbol, "5", f_confirmedM5(), ignore_invalid_symbol=true)
+    [aBitcoin, tBitcoin] = request.security_lower_tf("BITSTAMP:BTCUSD", "5", f_confirmedM5(), ignore_invalid_symbol=true)
+    [aEurUsd, tEurUsd] = request.security_lower_tf("OANDA:EURUSD", "5", f_confirmedM5(), ignore_invalid_symbol=true)
+    [aUsdJpy, tUsdJpy] = request.security_lower_tf("OANDA:USDJPY", "5", f_confirmedM5(), ignore_invalid_symbol=true)
+    [aEurJpy, tEurJpy] = request.security_lower_tf("OANDA:EURJPY", "5", f_confirmedM5(), ignore_invalid_symbol=true)
+    lastGold := f_forwardArray("XAUUSD", "OANDA:XAUUSD", aGold, tGold, lastGold)
+    lastNasdaq := f_forwardArray("NASDAQ", nasdaqSymbol, aNasdaq, tNasdaq, lastNasdaq)
+    lastBitcoin := f_forwardArray("BTCUSD", "BITSTAMP:BTCUSD", aBitcoin, tBitcoin, lastBitcoin)
+    lastEurUsd := f_forwardArray("EURUSD", "OANDA:EURUSD", aEurUsd, tEurUsd, lastEurUsd)
+    lastUsdJpy := f_forwardArray("USDJPY", "OANDA:USDJPY", aUsdJpy, tUsdJpy, lastUsdJpy)
+    lastEurJpy := f_forwardArray("EURJPY", "OANDA:EURJPY", aEurJpy, tEurJpy, lastEurJpy)
 
-if not na(tmUsdJpy) and not na(adxUsdJpy) and (na(lastUsdJpy) or tmUsdJpy != lastUsdJpy)
-    if barstate.isrealtime and barstate.isconfirmed
-        f_push("USDJPY", "OANDA:USDJPY", adxUsdJpy, tmUsdJpy)
-    lastUsdJpy := tmUsdJpy
+// Purely VISUAL: chosen market's true ADX for the current chart timeframe.
+// Changing 1m -> 5m -> 15m -> 1h -> 4h -> D1 automatically recalculates
+// the plotted ADX with its own 14-bar window for that specific timeframe.
+string displaySymbol = switch displayed
+    "XAUUSD" => "OANDA:XAUUSD"
+    "NASDAQ" => nasdaqSymbol
+    "BTCUSD" => "BITSTAMP:BTCUSD"
+    "EURUSD" => "OANDA:EURUSD"
+    "USDJPY" => "OANDA:USDJPY"
+    "EURJPY" => "OANDA:EURJPY"
+    => syminfo.tickerid
 
-if not na(tmEurJpy) and not na(adxEurJpy) and (na(lastEurJpy) or tmEurJpy != lastEurJpy)
-    if barstate.isrealtime and barstate.isconfirmed
-        f_push("EURJPY", "OANDA:EURJPY", adxEurJpy, tmEurJpy)
-    lastEurJpy := tmEurJpy
+float displayAdx = displayed == "Chart symbol" ? f_adx() : request.security(displaySymbol, timeframe.period, f_adx(), gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off, ignore_invalid_symbol=true)
 
-float plotADX = switch displayed
-    "XAUUSD" => adxGold
-    "NASDAQ" => adxNasdaq
-    "BTCUSD" => adxBitcoin
-    "EURUSD" => adxEurUsd
-    "USDJPY" => adxUsdJpy
-    => adxEurJpy
-
-plot(plotADX, "Last confirmed M5 ADX(14)", color=plotADX >= threshold ? color.lime : color.gray, linewidth=2)
-hline(30, "ADX trigger / rearm boundary", color=color.orange, linestyle=hline.style_dashed)
+plot(displayAdx, title="ADX(14) — Current Chart Timeframe", color=displayAdx >= level ? color.lime : color.gray, linewidth=2)
+hline(30, title="ADX 30 — M5 alert threshold", color=color.orange, linestyle=hline.style_dashed)

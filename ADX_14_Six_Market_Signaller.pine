@@ -1,0 +1,81 @@
+//@version=6
+indicator("ADX 14 | Six-Market Telegram Signaller", shorttitle="ADX30 Six Markets", overlay=false, dynamic_requests=true)
+
+// All readings use the last COMPLETED 5-minute candle.
+// Keep this indicator on a 1-minute chart so a new M5 close is forwarded promptly.
+// Only ONE TradingView alert is required: "Any alert() function call".
+
+string nasdaqSymbol = input.string("OANDA:NAS100USD", "NASDAQ family member", options=["OANDA:NAS100USD", "FOREXCOM:NAS100", "CAPITALCOM:US100", "CME_MINI:NQ1!", "CME_MINI:MNQ1!", "PEPPERSTONE:NAS100"], group="NASDAQ Family")
+string displayed = input.string("NASDAQ", "Display ADX for", options=["XAUUSD", "NASDAQ", "BTCUSD", "EURUSD", "USDJPY", "EURJPY"], group="Chart")
+
+const int adxLength = 14
+const float threshold = 30.0
+
+f_lastConfirmedADX() =>
+    [diPlus, diMinus, adxValue] = ta.dmi(adxLength, adxLength)
+    [adxValue[1], time_close[1]]
+
+[adxGold, tmGold] = request.security("OANDA:XAUUSD", "5", f_lastConfirmedADX(), gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_on, ignore_invalid_symbol=true)
+[adxNasdaq, tmNasdaq] = request.security(nasdaqSymbol, "5", f_lastConfirmedADX(), gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_on, ignore_invalid_symbol=true)
+[adxBitcoin, tmBitcoin] = request.security("BITSTAMP:BTCUSD", "5", f_lastConfirmedADX(), gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_on, ignore_invalid_symbol=true)
+[adxEurUsd, tmEurUsd] = request.security("OANDA:EURUSD", "5", f_lastConfirmedADX(), gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_on, ignore_invalid_symbol=true)
+[adxUsdJpy, tmUsdJpy] = request.security("OANDA:USDJPY", "5", f_lastConfirmedADX(), gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_on, ignore_invalid_symbol=true)
+[adxEurJpy, tmEurJpy] = request.security("OANDA:EURJPY", "5", f_lastConfirmedADX(), gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_on, ignore_invalid_symbol=true)
+
+if not (timeframe.isminutes and timeframe.multiplier == 1)
+    runtime.error("Run on a 1-minute chart. All six ADX calculations use completed M5 bars.")
+
+f_push(string ticker, string symbol, float adxValue, int barCloseMs) =>
+    string payload = '{"version":3,"ticker":"' + ticker + '","source":"' + symbol + '","bar_time":' + str.tostring(barCloseMs) + ',"timeframe":"5","period":14,"adx":' + str.tostring(adxValue, "#.####") + '}'
+    alert(payload, alert.freq_all)
+
+// The backend, not Pine, determines rising crosses through 30 and the reset
+// below 30. This prevents opposing-direction alerts and persists state across
+// changes to the TradingView indicator's runtime.
+var int lastGold = na
+var int lastNasdaq = na
+var int lastBitcoin = na
+var int lastEurUsd = na
+var int lastUsdJpy = na
+var int lastEurJpy = na
+
+if not na(tmGold) and not na(adxGold) and (na(lastGold) or tmGold != lastGold)
+    if barstate.isrealtime and barstate.isconfirmed
+        f_push("XAUUSD", "OANDA:XAUUSD", adxGold, tmGold)
+    lastGold := tmGold
+
+if not na(tmNasdaq) and not na(adxNasdaq) and (na(lastNasdaq) or tmNasdaq != lastNasdaq)
+    if barstate.isrealtime and barstate.isconfirmed
+        f_push("NASDAQ", nasdaqSymbol, adxNasdaq, tmNasdaq)
+    lastNasdaq := tmNasdaq
+
+if not na(tmBitcoin) and not na(adxBitcoin) and (na(lastBitcoin) or tmBitcoin != lastBitcoin)
+    if barstate.isrealtime and barstate.isconfirmed
+        f_push("BTCUSD", "BITSTAMP:BTCUSD", adxBitcoin, tmBitcoin)
+    lastBitcoin := tmBitcoin
+
+if not na(tmEurUsd) and not na(adxEurUsd) and (na(lastEurUsd) or tmEurUsd != lastEurUsd)
+    if barstate.isrealtime and barstate.isconfirmed
+        f_push("EURUSD", "OANDA:EURUSD", adxEurUsd, tmEurUsd)
+    lastEurUsd := tmEurUsd
+
+if not na(tmUsdJpy) and not na(adxUsdJpy) and (na(lastUsdJpy) or tmUsdJpy != lastUsdJpy)
+    if barstate.isrealtime and barstate.isconfirmed
+        f_push("USDJPY", "OANDA:USDJPY", adxUsdJpy, tmUsdJpy)
+    lastUsdJpy := tmUsdJpy
+
+if not na(tmEurJpy) and not na(adxEurJpy) and (na(lastEurJpy) or tmEurJpy != lastEurJpy)
+    if barstate.isrealtime and barstate.isconfirmed
+        f_push("EURJPY", "OANDA:EURJPY", adxEurJpy, tmEurJpy)
+    lastEurJpy := tmEurJpy
+
+float plotADX = switch displayed
+    "XAUUSD" => adxGold
+    "NASDAQ" => adxNasdaq
+    "BTCUSD" => adxBitcoin
+    "EURUSD" => adxEurUsd
+    "USDJPY" => adxUsdJpy
+    => adxEurJpy
+
+plot(plotADX, "Last confirmed M5 ADX(14)", color=plotADX >= threshold ? color.lime : color.gray, linewidth=2)
+hline(30, "ADX trigger / rearm boundary", color=color.orange, linestyle=hline.style_dashed)

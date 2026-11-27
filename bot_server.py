@@ -417,36 +417,20 @@ def signal_audit() -> str:
     if not rows:
         return "No ADX events"
     values = {row["ticker"]: row["adx"] for row in rows}
-    return "\n".join(f"{ticker} — {values[ticker]:.2f}" for ticker in PAIRS if ticker in values)
+    return "\n".join(f"{ticker}, {values[ticker]:.0f}" for ticker in PAIRS if ticker in values)
 
 
 
 def current_status() -> str:
-    """Current last-completed M5 ADX value for every configured market."""
-    assert config is not None
+    """Latest confirmed M5 ADX, ticker and rounded integer only."""
     with closing(db_connect()) as conn:
-        rows = {
-            row["ticker"]: row
-            for row in conn.execute(
-                "SELECT ticker,bar_time,adx,source,armed FROM adx_latest"
-            ).fetchall()
-        }
-    now_ms = int(time.time() * 1000)
-    lines = ["ADX(14) M5 — latest confirmed readings"]
-    stale = []
-    for ticker in PAIRS:
-        row = rows.get(ticker)
-        if row is None:
-            lines.append(f"{ticker} — WAITING FOR FIRST UPDATE")
-            continue
-        name = f"NASDAQ ({row['source']})" if ticker == "NASDAQ" else ticker
-        level = "BELOW 30" if row["adx"] < 30 else "AT/ABOVE 30"
-        lines.append(f"{name} — {row['adx']:.2f} ({level})")
-        if now_ms - row["bar_time"] > config.stale_after_minutes * 60_000:
-            stale.append(ticker)
-    if stale:
-        lines.append("⚠️ STALE MONITOR: " + ", ".join(stale))
-    return "\n".join(lines)
+        values = {row["ticker"]: row["adx"] for row in conn.execute(
+            "SELECT ticker,adx FROM adx_latest"
+        ).fetchall()}
+    return "\n".join(
+        f"{ticker}, {values[ticker]:.0f}" if ticker in values else f"{ticker}, N/A"
+        for ticker in PAIRS
+    )
 
 
 def handle_telegram_update(data: dict) -> None:

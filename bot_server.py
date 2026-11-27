@@ -1,6 +1,6 @@
 """Six-market M5 ADX(14) signal bot: TradingView readings -> Telegram alerts.
 
-This service does NOT determine trade validity, entries, exits or cancellations.
+This service receives MAER v4 setup-ready observations; it does NOT execute trades.
 Run one application worker with persistent SQLite storage.
 """
 from __future__ import annotations
@@ -72,6 +72,75 @@ class ADXReading(BaseModel):
             raise ValueError("bar_time is in the future")
 
 
+class MAERM5(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    bar_time: int = Field(gt=1_500_000_000_000)
+    adx: float = Field(ge=0, le=100)
+    direction: Literal["BUY", "SELL", "NEUTRAL"]
+    ema: float | None
+    close: float | None
+
+
+class MAERSignal(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    direction: Literal["BUY", "SELL"]
+    trigger_time: int = Field(gt=1_500_000_000_000)
+    ready_time: int = Field(gt=1_500_000_000_000)
+
+
+class MAERMarket(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    ticker: Literal["XAUUSD", "NASDAQ", "BTCUSD", "EURUSD", "USDJPY", "EURJPY"]
+    source: str = Field(min_length=5, max_length=90)
+    timeframe: Literal["5"]
+    period: Literal[14]
+    m5: list[MAERM5] = Field(max_length=6)
+    rsi_timeframe: Literal["1"]
+    rsi_period: Literal[14]
+    rsi: float | None = Field(ge=0, le=100)
+    rsi_status: Literal[0, 30, 50, 70]
+    previous_rsi_status: Literal[0, 30, 50, 70]
+    rsi50_event: bool
+    signal: MAERSignal | None
+
+
+class MAERBatch(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    version: Literal[4]
+    event_time: int = Field(gt=1_500_000_000_000)
+    markets: list[MAERMarket] = Field(min_length=1, max_length=6)
+
+
+def validate_maer_batch(batch: MAERBatch) -> None:
+    now = int(time.time() * 1000)
+    if batch.event_time > now + 120000:
+        raise ValueError("event_time is in the future")
+    if len({m.ticker for m in batch.markets}) != len(batch.markets):
+        raise ValueError("duplicate market")
+    for market in batch.markets:
+        # Reuse the existing feed whitelist, even for RSI-only updates.
+        ADXReading(version=3, ticker=market.ticker, source=market.source,
+                   bar_time=batch.event_time, timeframe="5", period=14,
+                   adx=0).check_logic()
+        for reading in market.m5:
+            ADXReading(version=3, ticker=market.ticker, source=market.source,
+                       bar_time=reading.bar_time, timeframe="5", period=14,
+                       adx=reading.adx).check_logic()
+        signal = market.signal
+        if signal:
+            if not signal.trigger_time <= signal.ready_time <= batch.event_time + 120000:
+                raise ValueError("invalid signal chronology")
+            if market.rsi_status == 0 or market.previous_rsi_status == 0:
+                raise ValueError("unknown RSI history")
+            if market.rsi_status != 50 and not market.rsi50_event:
+                raise ValueError("RSI is not ready")
+            for reading in market.m5:
+                if reading.bar_time == signal.trigger_time and (
+                    reading.direction != signal.direction or reading.adx < 30
+                ):
+                    raise ValueError("signal disagrees with trigger reading")
+
+
 def env_required(name: str, min_len: int) -> str:
     value = os.getenv(name, "").strip()
     if len(value) < min_len or "REPLACE" in value:
@@ -129,6 +198,13 @@ def initialize_db() -> None:
             );
             CREATE INDEX IF NOT EXISTS signal_expiry_idx
                 ON signal_messages(expires_at_ms);
+            CREATE TABLE IF NOT EXISTS maer_signals (
+                ticker TEXT NOT NULL,
+                trigger_time INTEGER NOT NULL,
+                ready_time INTEGER NOT NULL,
+                direction TEXT NOT NULL,
+                PRIMARY KEY(ticker, trigger_time)
+            );
             CREATE TABLE IF NOT EXISTS adx_latest (
                 ticker TEXT PRIMARY KEY,
                 bar_time INTEGER NOT NULL,
@@ -151,6 +227,8 @@ def initialize_db() -> None:
                 ON adx_audit(bar_time);
             """
         )
+        # Retire unsent legacy ADX-only notifications, preserving audit history.
+        conn.execute("DELETE FROM outbox WHERE id LIKE 'adx:%'")
         # One-time retirement of old model data. Never delete new ADX alerts
         # after a service restart: their 24-hour lifecycle is handled by worker.
         converted = conn.execute(
@@ -252,18 +330,9 @@ def accept_adx_reading(item: ADXReading) -> bool:
             elif previous < 30 <= item.adx and armed:
                 kind = "CROSS30"
                 armed = 0
-                task_id = f"adx:{item.bar_time}:{item.ticker}"
-                recipients = authorized_chats(conn)
-                if recipients:
-                    name = (f"NASDAQ ({item.source})" if item.ticker == "NASDAQ"
-                            else item.ticker)
-                    body = (f"{name} — ADX 30\n"
-                            f"NY: {format_signal_time(item.bar_time)}")
-                    for chat_id in recipients:
-                        enqueue(conn, f"{task_id}:{chat_id}", chat_id, body)
-                    delivery = "queued"
-                else:
-                    delivery = "no_paired_chat"
+                # ADX qualification is silent. Only a V4 ready signal
+                # may create a Telegram notification.
+                delivery = "silent_activation"
             else:
                 # Above 30 without a new crossing cannot generate an alert.
                 armed = 0
@@ -298,24 +367,58 @@ def accept_adx_reading(item: ADXReading) -> bool:
     return True
 
 
+def accept_maer_batch(batch: MAERBatch) -> int:
+    validate_maer_batch(batch)
+    accepted = 0
+    for market in batch.markets:
+        for reading in sorted(market.m5, key=lambda r: r.bar_time):
+            accepted += int(accept_adx_reading(ADXReading(
+                version=3, ticker=market.ticker, source=market.source,
+                bar_time=reading.bar_time, timeframe="5", period=14,
+                adx=reading.adx)))
+        signal = market.signal
+        if signal is None:
+            continue
+        now = int(time.time() * 1000)
+        if signal.ready_time + SIGNAL_RETENTION_MS <= now:
+            continue
+        with closing(db_connect()) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            inserted = conn.execute(
+                "INSERT OR IGNORE INTO maer_signals(ticker,trigger_time,ready_time,direction) "
+                "VALUES(?,?,?,?)",
+                (market.ticker, signal.trigger_time, signal.ready_time, signal.direction),
+            ).rowcount
+            if inserted:
+                name = (f"NASDAQ ({market.source})" if market.ticker == "NASDAQ"
+                        else market.ticker)
+                body = f"{name} — MAER {signal.direction}\nNY: {format_signal_time(signal.ready_time)}"
+                for chat_id in authorized_chats(conn):
+                    enqueue(conn, f"maer:{signal.ready_time}:{market.ticker}:{signal.trigger_time}:{chat_id}",
+                            chat_id, body)
+            conn.commit()
+        if inserted:
+            LOG.info("MAER V4 ready ticker=%s direction=%s", market.ticker, signal.direction)
+    LOG.info("MAER V4 accepted markets=%d new_m5=%d", len(batch.markets), accepted)
+    return accepted
+
+
 def signal_audit() -> str:
-    """Exactly the last 24 hours of valid ADX upward-crossing signals."""
+    """One line per ticker with an ADX crossing in the last 24h, latest ADX."""
     cutoff_ms = int(time.time() * 1000) - SIGNAL_RETENTION_MS
     with closing(db_connect()) as conn:
         rows = conn.execute(
-            """SELECT ticker,bar_time,adx,source FROM adx_audit
-               WHERE kind='CROSS30' AND bar_time >= ?
-               ORDER BY bar_time DESC,id DESC""",
+            """SELECT l.ticker,l.adx FROM adx_latest AS l
+               WHERE EXISTS (SELECT 1 FROM adx_audit AS a
+                             WHERE a.ticker=l.ticker AND a.kind='CROSS30'
+                             AND a.bar_time >= ?)""",
             (cutoff_ms,),
         ).fetchall()
     if not rows:
-        return "No ADX(14) crossings above 30 in the last 24 hours."
-    return "\n".join(
-        (f"{'NASDAQ (' + row['source'] + ')' if row['ticker'] == 'NASDAQ' else row['ticker']}"
-         f" | ADX 30 | "
-         f"{datetime.fromtimestamp(row['bar_time'] / 1000, NEW_YORK_TZ).strftime('%m-%d %H:%M:%S %Z')}")
-        for row in rows
-    )
+        return "No ADX events"
+    values = {row["ticker"]: row["adx"] for row in rows}
+    return "\n".join(f"{ticker} — {values[ticker]:.2f}" for ticker in PAIRS if ticker in values)
+
 
 
 def current_status() -> str:
@@ -448,7 +551,7 @@ async def delivery_worker() -> None:
                     )
                     is_status = task_id.startswith("status:")
                     is_live_signal = task_id.startswith("adx:")
-                    is_signal = is_live_signal
+                    is_signal = is_live_signal or task_id.startswith("maer:")
                     try:
                         if is_delete:
                             response = await client.post(
@@ -607,10 +710,15 @@ async def tradingview_webhook(secret: str, request: Request):
         payload = await request.json()
         if not isinstance(payload, dict):
             raise ValueError("Expected JSON object")
-        # Only ADX(14) v3 readings are accepted; RSI v1/v2 is disabled.
-        reading = ADXReading.model_validate(payload)
-        accepted = accept_adx_reading(reading)
-        return {"ok": True, "new_reading": accepted}
+        if payload.get("version") == 4:
+            batch = MAERBatch.model_validate(payload)
+            accepted = accept_maer_batch(batch)
+            return {"ok": True, "version": 4, "new_readings": accepted}
+        # Legacy alerts cannot generate or overwrite MAER observations.
+        if payload.get("version") == 3:
+            ADXReading.model_validate(payload).check_logic()
+            return {"ok": True, "ignored_legacy": True}
+        raise ValueError("unsupported protocol")
 
 
     except Exception as ex:

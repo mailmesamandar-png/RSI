@@ -229,6 +229,9 @@ def initialize_db() -> None:
         )
         # Retire unsent legacy ADX-only notifications, preserving audit history.
         conn.execute("DELETE FROM outbox WHERE id LIKE 'adx:%'")
+        # Delivered trading signals remain permanently in chat.
+        # Cancel pending legacy signal-deletion tasks before the worker starts.
+        conn.execute("DELETE FROM outbox WHERE id LIKE 'delete_signal:%'")
         # One-time retirement of old model data. Never delete new ADX alerts
         # after a service restart: their 24-hour lifecycle is handled by worker.
         converted = conn.execute(
@@ -240,13 +243,6 @@ def initialize_db() -> None:
                 "OR id LIKE 'h1double:%' OR id LIKE 'status:%' "
                 "OR id LIKE 'delete_replay:%'"
             )
-            for row in conn.execute(
-                "SELECT chat_id,message_id FROM signal_messages"
-            ).fetchall():
-                enqueue(conn,
-                        f"delete_signal:{row['chat_id']}:{row['message_id']}",
-                        int(row["chat_id"]), str(row["message_id"]))
-            conn.execute("DELETE FROM signal_messages")
             for table in ("latest", "pair_latest", "pair_audit", "rsi_signal_gate",
                           "scan_jobs", "replay_messages", "h1_double_sweeps"):
                 conn.execute(f"DROP TABLE IF EXISTS {table}")
@@ -390,9 +386,8 @@ def accept_maer_batch(batch: MAERBatch) -> int:
                 (market.ticker, signal.trigger_time, signal.ready_time, signal.direction),
             ).rowcount
             if inserted:
-                name = (f"NASDAQ ({market.source})" if market.ticker == "NASDAQ"
-                        else market.ticker)
-                body = f"{name} — MAER {signal.direction}\nNY: {format_signal_time(signal.ready_time)}"
+                ready_et = datetime.fromtimestamp(signal.ready_time / 1000, tz=NEW_YORK_TZ)
+                body = f"{market.ticker}, {signal.direction.title()}, {ready_et.hour}:{ready_et.minute:02d} ET"
                 for chat_id in authorized_chats(conn):
                     enqueue(conn, f"maer:{signal.ready_time}:{market.ticker}:{signal.trigger_time}:{chat_id}",
                             chat_id, body)
@@ -492,36 +487,13 @@ def handle_telegram_update(data: dict) -> None:
         conn.commit()
 
 
-def queue_expired_signals() -> None:
-    """Durably schedule removal of delivered signals 24 hours after their M5 event."""
-    now_ms = int(time.time() * 1000)
-    with closing(db_connect()) as conn:
-        conn.execute("BEGIN IMMEDIATE")
-        due = conn.execute(
-            "SELECT chat_id,message_id FROM signal_messages "
-            "WHERE expires_at_ms <= ? LIMIT 100",
-            (now_ms,),
-        ).fetchall()
-        for row in due:
-            chat_id, message_id = row["chat_id"], row["message_id"]
-            enqueue(conn, f"delete_signal:{chat_id}:{message_id}",
-                    chat_id, str(message_id))
-            conn.execute(
-                "DELETE FROM signal_messages WHERE chat_id=? AND message_id=?",
-                (chat_id, message_id),
-            )
-        conn.commit()
-
-
-
 async def delivery_worker() -> None:
-    """Send replaceable status reports and keep only signals from the last 24h."""
+    """Send replaceable status reports and retain delivered trading signals."""
     assert config is not None
     endpoint = f"https://api.telegram.org/bot{config.telegram_token}"
     async with httpx.AsyncClient(timeout=8) as client:
         while True:
             try:
-                queue_expired_signals()
                 with closing(db_connect()) as conn:
                     rows = conn.execute(
                         "SELECT id,chat_id,body,attempts FROM outbox "
@@ -531,7 +503,7 @@ async def delivery_worker() -> None:
                 for row in rows:
                     task_id = row["id"]
                     is_delete = task_id.startswith(
-                        ("delete:", "delete_signal:", "delete_request:", "delete_replay:")
+                        ("delete:", "delete_request:", "delete_replay:")
                     )
                     is_status = task_id.startswith("status:")
                     is_live_signal = task_id.startswith("adx:")
@@ -626,13 +598,6 @@ async def delivery_worker() -> None:
                                             "UPDATE adx_audit SET delivery_status='sent' WHERE task_id=?",
                                             (base_task,),
                                         )
-                                conn.execute(
-                                    """INSERT OR IGNORE INTO signal_messages(
-                                         chat_id,message_id,signal_at_ms,expires_at_ms)
-                                       VALUES(?,?,?,?)""",
-                                    (row["chat_id"], message_id, event_time_ms,
-                                     event_time_ms + SIGNAL_RETENTION_MS),
-                                )
                             # Legacy 'reply:' messages, if any, are not
                             # deleted automatically because their purpose is unknown.
                             conn.execute("DELETE FROM outbox WHERE id=?", (task_id,))
